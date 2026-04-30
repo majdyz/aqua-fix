@@ -1,0 +1,31 @@
+/* Motion Fix overrides the warm part of the suite palette */
+.motion-app {
+  --accent: #ff8b4a;
+  --accent-2: #ff5e7e;
+}
+
+.motion-app .bg {
+  background:
+    radial-gradient(60% 50% at 30% 0%, rgba(255, 139, 74, 0.18), transparent 60%),
+    radial-gradient(50% 40% at 80% 20%, rgba(255, 94, 126, 0.14), transparent 60%),
+    radial-gradient(70% 60% at 50% 100%, rgba(255, 139, 74, 0.06), transparent 70%),
+    var(--bg-0);
+}
+
+.motion-app header h1 {
+  background: linear-gradient(120deg, #ffd6b8, #ffb6c4);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.motion-coming-soon {
+  margin: 0;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+  background: rgba(255, 139, 74, 0.06);
+  border: 1px dashed rgba(255, 139, 74, 0.4);
+  border-radius: 12px;
+}

@@ -1,42 +1,23 @@
 {
-  "name": "aqua-fix",
+  "name": "dive-tools",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://majdyz.github.io/aqua-fix",
   "scripts": {
-    "dev": "vite",
-    "build": "node scripts/build-icons.mjs && tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview",
-    "icons": "node scripts/build-icons.mjs",
+    "dev:aqua": "pnpm --filter aqua-fix dev",
+    "dev:motion": "pnpm --filter motion-fix dev",
+    "build": "pnpm --filter aqua-fix build && pnpm --filter motion-fix build && node scripts/assemble-dist.mjs",
+    "build:aqua": "pnpm --filter aqua-fix build",
+    "build:motion": "pnpm --filter motion-fix build",
+    "preview": "vite preview --outDir dist",
     "predeploy": "pnpm build",
     "deploy": "gh-pages -d dist --nojekyll"
   },
-  "dependencies": {
-    "react": "^19.2.5",
-    "react-dom": "^19.2.5"
-  },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^24.12.2",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.1",
-    "eslint": "^10.2.1",
-    "eslint-plugin-react-hooks": "^7.1.1",
-    "eslint-plugin-react-refresh": "^0.5.2",
     "gh-pages": "^6.3.0",
-    "globals": "^17.5.0",
-    "sharp": "^0.34.5",
-    "typescript": "~6.0.2",
-    "typescript-eslint": "^8.58.2",
     "vite": "^8.0.10"
   },
   "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "sharp"
-    ]
+    "onlyBuiltDependencies": ["esbuild", "sharp"]
   }
 }

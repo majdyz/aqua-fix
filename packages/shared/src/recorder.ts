@@ -37,21 +37,13 @@ export function pickBitrate(width: number, height: number): number {
 type CaptureContext = {
   videoStream: MediaStream;
   videoTrack: MediaStreamTrack;
-  pushFrame: () => void;
 };
 
 export function buildCaptureContext(canvas: HTMLCanvasElement): CaptureContext {
-  // Active capture at 30fps. The passive captureStream(0)+requestFrame path
-  // gave 1:1 frame mapping but lost frames mid-recording on iOS Safari for
-  // long 4K clips ("black middle" symptom). Active mode is browser-managed
-  // and far more stable.
+  // Active capture at 30fps. Passive mode dropped frames mid-record on iOS Safari.
   const canvasStream = canvas.captureStream(30);
   const videoTrack = canvasStream.getVideoTracks()[0];
-  return {
-    videoStream: canvasStream,
-    videoTrack,
-    pushFrame: () => undefined,
-  };
+  return { videoStream: canvasStream, videoTrack };
 }
 
 type AudioRouting = {
@@ -83,8 +75,6 @@ export function captureAudioForRecording(routing: AudioRouting | null): {
   cleanup: () => void;
 } {
   if (!routing) return { tracks: [], cleanup: () => undefined };
-  // Resume fire-and-forget so we don't burn the user-gesture window awaiting
-  // a Promise that can hang on some browsers.
   if (routing.ctx.state === "suspended") {
     routing.ctx.resume().catch(() => undefined);
   }
@@ -102,9 +92,6 @@ export function captureAudioForRecording(routing: AudioRouting | null): {
   };
 }
 
-// Output sink: streams MediaRecorder chunks to disk via the Origin Private File
-// System so a long recording doesn't sit in JS heap. Falls back to in-memory
-// if OPFS isn't available (older Safari, private mode).
 export type RecordingSink = {
   write: (chunk: BlobPart) => Promise<void>;
   finalize: (mimeType: string) => Promise<Blob>;
@@ -119,8 +106,7 @@ type WritableHandle = FileSystemFileHandle & {
   createWritable?: (options?: { keepExistingData?: boolean }) => Promise<FileSystemWritableFileStream>;
 };
 
-// Best-effort sweep of leftover aqua-*.tmp entries from previous sessions.
-export async function pruneOldRecordings(): Promise<void> {
+export async function pruneOldRecordings(prefix: string): Promise<void> {
   const storage = navigator.storage as Navigator["storage"] & StorageWithDirectory;
   if (!storage || typeof storage.getDirectory !== "function") return;
   try {
@@ -130,7 +116,7 @@ export async function pruneOldRecordings(): Promise<void> {
     };
     if (typeof dir.values !== "function") return;
     for await (const entry of dir.values()) {
-      if (entry.name.startsWith("aqua-") && entry.name.endsWith(".tmp")) {
+      if (entry.name.startsWith(prefix) && entry.name.endsWith(".tmp")) {
         root.removeEntry(entry.name).catch(() => undefined);
       }
     }
@@ -139,12 +125,12 @@ export async function pruneOldRecordings(): Promise<void> {
   }
 }
 
-export async function createRecordingSink(): Promise<RecordingSink> {
+export async function createRecordingSink(prefix: string): Promise<RecordingSink> {
   const storage = navigator.storage as Navigator["storage"] & StorageWithDirectory;
   if (storage && typeof storage.getDirectory === "function") {
     try {
       const root = await storage.getDirectory();
-      const name = `aqua-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+      const name = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
       const handle = (await root.getFileHandle(name, { create: true })) as WritableHandle;
       if (typeof handle.createWritable === "function") {
         const writable = await handle.createWritable();
@@ -170,9 +156,7 @@ export async function createRecordingSink(): Promise<RecordingSink> {
               }
               closed = true;
             }
-            // The download anchor is still streaming from this OPFS file when
-            // cleanup runs — removing it now truncates the saved file. Defer
-            // the entry removal; stale entries get pruned on next launch.
+            // Defer entry removal — anchor download is still streaming from it.
             setTimeout(() => {
               root.removeEntry(name).catch(() => undefined);
             }, 60_000);
@@ -193,4 +177,29 @@ export async function createRecordingSink(): Promise<RecordingSink> {
       chunks.length = 0;
     },
   };
+}
+
+export async function shareOrDownload(blob: Blob, filename: string): Promise<void> {
+  // iOS Safari's <a download> is unreliable for large video blobs.
+  // Web Share API → opens the iOS share sheet (Photos / Files / AirDrop).
+  const file = new File([blob], filename, { type: blob.type });
+  const nav = navigator as Navigator & { canShare?: (data: ShareData) => boolean };
+  if (typeof nav.share === "function" && nav.canShare?.({ files: [file] })) {
+    try {
+      await nav.share({ files: [file], title: filename });
+      return;
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") return;
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  a.target = "_blank";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
