@@ -403,7 +403,16 @@ export default function App() {
         <canvas ref={canvasRef} />
         <video ref={videoRef} style={{ display: "none" }} />
         {mode === "idle" && (
-          <div className="placeholder">
+          <label className="placeholder">
+            <input
+              type="file"
+              accept="image/*,video/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFile(f);
+                e.target.value = "";
+              }}
+            />
             <div className="dropper">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path
@@ -411,9 +420,9 @@ export default function App() {
                   fill="currentColor"
                 />
               </svg>
-              <p>pick a photo or video</p>
+              <p>tap to pick a photo or video</p>
             </div>
-          </div>
+          </label>
         )}
         {error && <div className="error">{error}</div>}
         {recording && (
