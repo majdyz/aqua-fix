@@ -338,7 +338,7 @@ export default function App() {
     canvasRef.current.toBlob(
       (blob) => {
         if (!blob) return;
-        triggerDownload(blob, `${fileNameRef.current}-aqua.jpg`);
+        triggerDownload(blob, `${fileNameRef.current}-aqua.jpg`).catch(() => undefined);
       },
       "image/jpeg",
       0.95,
@@ -497,7 +497,7 @@ export default function App() {
           try {
             await writeQueue;
             const blob = await sink.finalize(candidate.mime || "video/webm");
-            triggerDownload(blob, `${fileNameRef.current}-aqua.${candidate.ext}`);
+            await triggerDownload(blob, `${fileNameRef.current}-aqua.${candidate.ext}`);
           } catch (err) {
             setError("Save failed: " + (err instanceof Error ? err.message : String(err)));
           } finally {
@@ -921,16 +921,32 @@ function matchesPreset(a: Settings, b: Settings, eps = 0.01) {
   );
 }
 
-function triggerDownload(blob: Blob, filename: string) {
+async function triggerDownload(blob: Blob, filename: string) {
+  // iOS Safari's anchor[download] mechanism is unreliable for large video
+  // blobs ("Download failed"). Web Share API is the supported path on iOS:
+  // it opens the share sheet and the user picks Photos / Files / etc.
+  const file = new File([blob], filename, { type: blob.type });
+  const nav = navigator as Navigator & { canShare?: (data: ShareData) => boolean };
+  if (typeof nav.share === "function" && nav.canShare?.({ files: [file] })) {
+    try {
+      await nav.share({ files: [file], title: filename });
+      return;
+    } catch (e) {
+      // AbortError = user cancelled. Anything else: fall through to the
+      // anchor fallback rather than dropping the recording entirely.
+      if (e instanceof Error && e.name === "AbortError") return;
+    }
+  }
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   a.rel = "noopener";
+  a.target = "_blank";
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function Slider({
