@@ -73,6 +73,7 @@ export default function App() {
   const onEndedRef = useRef<(() => void) | null>(null);
   const sinkRef = useRef<RecordingSink | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const lastStatsRefreshRef = useRef(0);
 
   const [mode, setMode] = useState<Mode>("idle");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -145,15 +146,38 @@ export default function App() {
     statsRef.current = computeStats(v, v.videoWidth, v.videoHeight, settings.castStrength);
   }, [settings.castStrength, mode]);
 
+  function maybeRefreshStats(video: HTMLVideoElement) {
+    // Adaptive: re-sample stats every ~1s from the current frame and blend
+    // with the existing stats so cast/colour changes (depth, sun, scene cuts)
+    // are tracked without flicker. EMA at 15% feels responsive but smooth.
+    const now = performance.now();
+    if (now - lastStatsRefreshRef.current < 1000) return;
+    if (video.readyState < 2) return;
+    try {
+      const fresh = computeStats(video, video.videoWidth, video.videoHeight, settingsRef.current.castStrength);
+      const cur = statsRef.current;
+      if (cur && cur !== IDENTITY_STATS) {
+        statsRef.current = lerpStats(cur, fresh, 0.15);
+      } else {
+        statsRef.current = fresh;
+      }
+      lastStatsRefreshRef.current = now;
+    } catch {
+      // ignore — keep existing stats
+    }
+  }
+
   function startPreview() {
     const video = videoRef.current as VideoWithRVFC | null;
     if (!video) return;
     previewActiveRef.current = true;
+    lastStatsRefreshRef.current = 0;
 
     const renderFromVideo = () => {
       if (!rendererRef.current || !statsRef.current || !videoRef.current) return;
       const v = videoRef.current;
       if (v.readyState < 2) return;
+      maybeRefreshStats(v);
       rendererRef.current.uploadSource(v, v.videoWidth, v.videoHeight);
       const eff = showOriginalRef.current ? OFF_SETTINGS : settingsRef.current;
       rendererRef.current.render(statsRef.current, eff);
@@ -465,9 +489,11 @@ export default function App() {
       setError("Recording error: " + msg);
     };
 
+    lastStatsRefreshRef.current = 0;
     const renderAndPush = () => {
       if (!recordingFlagRef.current || !rendererRef.current || !statsRef.current || !videoRef.current) return;
       const v = videoRef.current;
+      maybeRefreshStats(v);
       rendererRef.current.uploadSource(v, v.videoWidth, v.videoHeight);
       const eff = showOriginalRef.current ? OFF_SETTINGS : settingsRef.current;
       rendererRef.current.render(statsRef.current, eff);
@@ -902,6 +928,21 @@ export default function App() {
       </footer>
     </div>
   );
+}
+
+function lerpStats(a: Stats, b: Stats, t: number): Stats {
+  const mix = (x: number, y: number) => x * (1 - t) + y * t;
+  const mix3 = (
+    p: [number, number, number],
+    q: [number, number, number],
+  ): [number, number, number] => [mix(p[0], q[0]), mix(p[1], q[1]), mix(p[2], q[2])];
+  return {
+    mean: mix3(a.mean, b.mean),
+    wbGain: mix3(a.wbGain, b.wbGain),
+    min: mix3(a.min, b.min),
+    max: mix3(a.max, b.max),
+    alpha: b.alpha,
+  };
 }
 
 function formatTime(seconds: number): string {
