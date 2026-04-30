@@ -800,7 +800,9 @@ export default function App() {
       </section>
 
       <footer>
-        <p>Tap Share → "Add to Home Screen" to install.</p>
+        <p>
+          Companion: <a href="../motion-fix/" style={{ color: "#ff8b4a" }}>Motion Fix</a> · Tap Share → "Add to Home Screen" to install.
+        </p>
       </footer>
     </div>
   );
