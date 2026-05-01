@@ -128,36 +128,28 @@ export default function App() {
     const a = analysisRef.current;
     const sm = smoothRef.current;
     const cropAmt = cropRef.current;
-    // Uniform scale-up so the rotated/translated edges don't reveal the
-    // canvas background. (1 - 2*crop) is how much of each axis we're
-    // guaranteed to keep within the visible window.
-    const scaleUp = 1 / Math.max(0.0001, 1 - 2 * cropAmt);
+    // Floor so the slider at 0 still leaves a tiny budget for stabilisation —
+    // the alternative is "Max crop = 0" disabling the algorithm entirely,
+    // which surprises users.
+    const effCrop = Math.max(0.015, cropAmt);
+    const maxScaleUp = 1 / (1 - 2 * effCrop);
 
     if (!a || !sm) {
-      ctx.setTransform(
-        scaleUp,
-        0,
-        0,
-        scaleUp,
-        w * (1 - scaleUp) * 0.5,
-        h * (1 - scaleUp) * 0.5,
-      );
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       return;
     }
 
     const idx = frameIndexForTime(a, time);
-    const t = residualTransform(a, sm, idx);
-    // Clamp residual translation to the crop budget so a runaway path can't
-    // throw the frame entirely off-canvas.
-    const maxX = w * cropAmt;
-    const maxY = h * cropAmt;
-    const tx = clamp(t.tx, -maxX, maxX);
-    const ty = clamp(t.ty, -maxY, maxY);
-    // Compose: M = ScaleAroundCenter * Similarity(t)
-    // The 2D similarity matrix in 2x3 form: [a -b tx; b a ty]
-    // Pre-multiplied by scaleUp around the centre:
-    //   M = [s 0 cx(1-s); 0 s cy(1-s)] * [a -b tx; b a ty; 0 0 1]
-    //     = [s·a -s·b s·tx + cx(1-s);  s·b s·a s·ty + cy(1-s)]
+    const raw = residualTransform(a, sm, idx);
+    // Clamp the residual so the canvas is fully covered by the source frame
+    // even at maxScaleUp. Without this, residual rotation or scale-down can
+    // expose canvas background and the result looks "warped".
+    const t = clampResidualToCanvas(raw, maxScaleUp, w, h);
+    // Use only as much zoom as actually required by this frame's residual,
+    // up to the user's max crop. Steady frames stay at scale 1 (no zoom);
+    // shaky frames zoom in to hide the residual edges.
+    const needed = requiredScaleUp(t, w, h);
+    const scaleUp = Math.max(1, Math.min(needed, maxScaleUp));
     const cx = w * 0.5;
     const cy = h * 0.5;
     ctx.setTransform(
@@ -165,9 +157,82 @@ export default function App() {
       scaleUp * t.b,
       -scaleUp * t.b,
       scaleUp * t.a,
-      scaleUp * tx + cx * (1 - scaleUp),
-      scaleUp * ty + cy * (1 - scaleUp),
+      scaleUp * t.tx + cx * (1 - scaleUp),
+      scaleUp * t.ty + cy * (1 - scaleUp),
     );
+  }
+
+  // Compute the smallest scale-up that, combined with this residual, would
+  // make the source frame cover the canvas completely. Inverse of the full
+  // transform must map every canvas point into the source rectangle.
+  function requiredScaleUp(t: { a: number; b: number; tx: number; ty: number }, w: number, h: number): number {
+    const a = t.a;
+    const b = t.b;
+    const r = a * a + b * b;
+    if (r < 1e-9) return 1e6;
+    const aInv = a / r;
+    const bInv = b / r;
+    const txInv = -(a * t.tx + b * t.ty) / r;
+    const tyInv = (b * t.tx - a * t.ty) / r;
+    const halfW = w * 0.5;
+    const halfH = h * 0.5;
+    let s = 1;
+    for (const cx of [-halfW, halfW]) {
+      for (const cy of [-halfH, halfH]) {
+        const numX = aInv * cx + bInv * cy;
+        const numY = -bInv * cx + aInv * cy;
+        const upperX = halfW - txInv;
+        const lowerX = -halfW - txInv;
+        const upperY = halfH - tyInv;
+        const lowerY = -halfH - tyInv;
+        if (numX > 0) {
+          if (upperX <= 0) return 1e6;
+          s = Math.max(s, numX / upperX);
+        } else if (numX < 0) {
+          if (lowerX >= 0) return 1e6;
+          s = Math.max(s, numX / lowerX);
+        }
+        if (numY > 0) {
+          if (upperY <= 0) return 1e6;
+          s = Math.max(s, numY / upperY);
+        } else if (numY < 0) {
+          if (lowerY >= 0) return 1e6;
+          s = Math.max(s, numY / lowerY);
+        }
+      }
+    }
+    return s;
+  }
+
+  // If the residual needs more zoom than the user's crop allows, lerp it
+  // back toward identity (the unstabilised source frame) until it fits.
+  // Binary search the lerp factor — requiredScaleUp is monotonic in lerp.
+  function clampResidualToCanvas(
+    t: { a: number; b: number; tx: number; ty: number },
+    scaleUp: number,
+    w: number,
+    h: number,
+  ): { a: number; b: number; tx: number; ty: number } {
+    if (requiredScaleUp(t, w, h) <= scaleUp + 1e-6) return t;
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < 14; i++) {
+      const mid = (lo + hi) * 0.5;
+      const tk = {
+        a: 1 + (t.a - 1) * mid,
+        b: t.b * mid,
+        tx: t.tx * mid,
+        ty: t.ty * mid,
+      };
+      if (requiredScaleUp(tk, w, h) <= scaleUp + 1e-6) lo = mid;
+      else hi = mid;
+    }
+    return {
+      a: 1 + (t.a - 1) * lo,
+      b: t.b * lo,
+      tx: t.tx * lo,
+      ty: t.ty * lo,
+    };
   }
 
   type VideoWithRVFC = HTMLVideoElement & {
@@ -764,6 +829,3 @@ export default function App() {
   );
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}

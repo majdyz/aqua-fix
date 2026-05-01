@@ -704,10 +704,12 @@ export function smoothPath(
 
   const txBox = Math.max(1, width * crop);
   const tyBox = Math.max(1, height * crop);
-  // Rotation/scale don't have a meaningful "crop budget"; clamp via a
-  // generous box so the optimiser can deviate freely. Box is on the
-  // raw-vs-smooth distance, not absolute, so this just bounds drift.
-  const abBox = 0.2;
+  // Rotation/scale residual must stay tiny — every degree of rotation or
+  // percent of scale uncovers more canvas than the crop budget can hide,
+  // and the renderer would clamp it back to identity anyway. 0.04 here
+  // means the smooth a/b can drift up to ~4% from raw which is at the edge
+  // of what the crop typically affords.
+  const abBox = 0.04;
 
   return {
     smoothA: l1Smooth(aMed, w.lambda1Rs, w.lambda2Rs, abBox),
