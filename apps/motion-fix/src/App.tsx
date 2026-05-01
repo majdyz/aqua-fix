@@ -4,6 +4,7 @@ import {
   buildCaptureContext,
   BusyOverlay,
   captureAudioForRecording,
+  CompareButton,
   createRecordingSink,
   FilePickerButton,
   Hero,
@@ -27,12 +28,13 @@ import {
   analyzeVideo,
   type AnalysisResult,
   frameIndexForTime,
-  gaussianSmooth,
-  sigmaForSmoothing,
+  residualTransform,
+  smoothPath,
 } from "./lib/stabilizer";
 
 type Mode = "idle" | "video";
 type AudioRouting = ReturnType<typeof attachAudioRouting>;
+type SmoothPath = ReturnType<typeof smoothPath>;
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -48,9 +50,9 @@ export default function App() {
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
 
   const analysisRef = useRef<AnalysisResult | null>(null);
-  const smoothedXRef = useRef<Float32Array | null>(null);
-  const smoothedYRef = useRef<Float32Array | null>(null);
+  const smoothRef = useRef<SmoothPath | null>(null);
   const cropRef = useRef(0.1);
+  const showOriginalRef = useRef(false);
 
   const [mode, setMode] = useState<Mode>("idle");
   const [busy, setBusy] = useState<string | null>(null);
@@ -64,19 +66,19 @@ export default function App() {
   const [analysisReady, setAnalysisReady] = useState(false);
   const [canRecord, setCanRecord] = useState(true);
   const [showInfo, setShowInfo] = useState(false);
+  const [showOriginal, setShowOriginal] = useState(false);
 
   useEffect(() => {
     cropRef.current = crop;
   }, [crop]);
+  useEffect(() => {
+    showOriginalRef.current = showOriginal;
+  }, [showOriginal]);
 
-  // Re-smooth the cumulative path when the slider changes — analysis is
-  // expensive but smoothing is a few hundred microseconds.
   useEffect(() => {
     const a = analysisRef.current;
     if (!a) return;
-    const sigma = sigmaForSmoothing(smoothing);
-    smoothedXRef.current = gaussianSmooth(a.cumX, sigma);
-    smoothedYRef.current = gaussianSmooth(a.cumY, sigma);
+    smoothRef.current = smoothPath(a, smoothing);
   }, [smoothing, analysisReady]);
 
   useEffect(() => {
@@ -88,12 +90,10 @@ export default function App() {
     drawStabilizedFrame();
   });
 
-  // Repaint when crop slider changes while paused — preview should update
-  // immediately even if the video isn't running.
   useEffect(() => {
     if (mode !== "video") return;
     drawStabilizedFrame();
-  }, [crop, smoothing, mode]);
+  }, [crop, smoothing, mode, showOriginal]);
 
   function drawStabilizedFrame() {
     const v = videoRef.current;
@@ -104,6 +104,13 @@ export default function App() {
     if (!ctx) return;
     if (c.width !== v.videoWidth) c.width = v.videoWidth;
     if (c.height !== v.videoHeight) c.height = v.videoHeight;
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (showOriginalRef.current) {
+      // Original passthrough — no transform, no crop.
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+      return;
+    }
     applyStabilizedTransform(ctx, c.width, c.height, v.currentTime);
     ctx.drawImage(v, 0, 0, c.width, c.height);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -116,35 +123,47 @@ export default function App() {
     time: number,
   ) {
     const a = analysisRef.current;
-    const sx = smoothedXRef.current;
-    const sy = smoothedYRef.current;
+    const sm = smoothRef.current;
     const cropAmt = cropRef.current;
-    // Uniform scale-up so the translated edges don't reveal the canvas
-    // background. (1 - 2*crop) is how much of each axis we're guaranteed to
-    // keep within the visible window.
-    const scale = 1 / Math.max(0.0001, 1 - 2 * cropAmt);
-    if (!a || !sx || !sy) {
-      ctx.setTransform(scale, 0, 0, scale, w * (1 - scale) * 0.5, h * (1 - scale) * 0.5);
+    // Uniform scale-up so the rotated/translated edges don't reveal the
+    // canvas background. (1 - 2*crop) is how much of each axis we're
+    // guaranteed to keep within the visible window.
+    const scaleUp = 1 / Math.max(0.0001, 1 - 2 * cropAmt);
+
+    if (!a || !sm) {
+      ctx.setTransform(
+        scaleUp,
+        0,
+        0,
+        scaleUp,
+        w * (1 - scaleUp) * 0.5,
+        h * (1 - scaleUp) * 0.5,
+      );
       return;
     }
+
     const idx = frameIndexForTime(a, time);
-    const dx = a.cumX[idx] - sx[idx];
-    const dy = a.cumY[idx] - sy[idx];
-    // Clamp the residual to the crop budget so a runaway path can't push the
-    // frame entirely off-canvas.
+    const t = residualTransform(a, sm, idx);
+    // Clamp residual translation to the crop budget so a runaway path can't
+    // throw the frame entirely off-canvas.
     const maxX = w * cropAmt;
     const maxY = h * cropAmt;
-    const tx = -clamp(dx, -maxX, maxX);
-    const ty = -clamp(dy, -maxY, maxY);
-    // setTransform composes: scale around the center, then translate by the
-    // residual. The (1-scale) terms re-center the scaled-up image.
+    const tx = clamp(t.tx, -maxX, maxX);
+    const ty = clamp(t.ty, -maxY, maxY);
+    // Compose: M = ScaleAroundCenter * Similarity(t)
+    // The 2D similarity matrix in 2x3 form: [a -b tx; b a ty]
+    // Pre-multiplied by scaleUp around the centre:
+    //   M = [s 0 cx(1-s); 0 s cy(1-s)] * [a -b tx; b a ty; 0 0 1]
+    //     = [s·a -s·b s·tx + cx(1-s);  s·b s·a s·ty + cy(1-s)]
+    const cx = w * 0.5;
+    const cy = h * 0.5;
     ctx.setTransform(
-      scale,
-      0,
-      0,
-      scale,
-      w * (1 - scale) * 0.5 + tx,
-      h * (1 - scale) * 0.5 + ty,
+      scaleUp * t.a,
+      scaleUp * t.b,
+      -scaleUp * t.b,
+      scaleUp * t.a,
+      scaleUp * tx + cx * (1 - scaleUp),
+      scaleUp * ty + cy * (1 - scaleUp),
     );
   }
 
@@ -203,8 +222,7 @@ export default function App() {
     setRecordProgress(0);
     setAnalysisReady(false);
     analysisRef.current = null;
-    smoothedXRef.current = null;
-    smoothedYRef.current = null;
+    smoothRef.current = null;
     teardownVideo();
     fileNameRef.current = file.name.replace(/\.[^.]+$/, "");
     setBusy("Loading video…");
@@ -240,9 +258,7 @@ export default function App() {
         setBusy(`Analyzing motion ${Math.floor(p * 100)}%`);
       });
       analysisRef.current = result;
-      const sigma = sigmaForSmoothing(smoothing);
-      smoothedXRef.current = gaussianSmooth(result.cumX, sigma);
-      smoothedYRef.current = gaussianSmooth(result.cumY, sigma);
+      smoothRef.current = smoothPath(result, smoothing);
       setAnalysisReady(true);
 
       v.play().catch(() => undefined);
@@ -539,40 +555,49 @@ export default function App() {
         <h4>Pipeline</h4>
         <ul>
           <li>
-            <b>Analysis pass</b> — play the video at <code>2×</code> speed
-            muted, capture each decoded frame via{" "}
+            <b>Analysis pass</b> — play the video at <code>2×</code> muted,
+            capture each decoded frame via{" "}
             <code>requestVideoFrameCallback</code>, downsample to a 128×72
             grayscale thumbnail.
           </li>
           <li>
-            <b>Block-matching</b> — for each consecutive thumbnail pair,
-            find the integer <code>(dx, dy)</code> in <code>±16 px</code>{" "}
-            that minimises sum-of-absolute-differences over the overlap;
-            sub-pixel parabolic refine on the 3 SAD samples around the
-            minimum, separately along x and y.
+            <b>Multi-point tracking</b> — a 4×3 grid of feature centres is
+            tracked between consecutive thumbnails using small patch
+            block-matching with sub-pixel parabolic refinement. Low-texture
+            patches are dropped via a confidence check.
           </li>
           <li>
-            <b>Path</b> — accumulate per-frame translations into a cumulative
-            camera path, scaled back to source resolution.
+            <b>Similarity transform</b> — for each frame pair, fit a 2D
+            similarity (translation + rotation + uniform scale) to the
+            inlier matches via closed-form least-squares (Umeyama 1991);
+            outliers above 2.5× the median residual are trimmed and the fit
+            is refined.
           </li>
           <li>
-            <b>Smoothing</b> — separable 1D Gaussian (mirror-padded) on
-            <code>cumX</code> / <code>cumY</code>; the slider maps to{" "}
-            <code>sigma 1..60</code> frames. Re-smoothing on slider change
-            is sub-millisecond — no re-analysis.
+            <b>Cumulative path</b> — compose per-frame transforms into the
+            absolute camera path: <code>(a, b, tx, ty)</code> per frame.
           </li>
           <li>
-            <b>Render</b> — residual <code>= cum − smoothed</code> applied
-            as a 2D canvas <code>setTransform()</code> with a uniform
-            scale-up (<code>1 / (1 − 2·crop)</code>) so the translated
-            edges don't reveal the canvas background.
+            <b>Smoothing</b> — median pre-filter to absorb tracking spikes,
+            then separable 1D Gaussian (mirror-padded). Slider maps
+            quadratically to <code>sigma 4..240</code> frames (0.13 s to 8 s
+            at 30 Hz). Re-smoothing is sub-millisecond — slider tweaks don't
+            re-run analysis.
+          </li>
+          <li>
+            <b>Render</b> — residual{" "}
+            <code>= smoothed ∘ raw⁻¹</code> applied as a 2D{" "}
+            <code>setTransform()</code> with a uniform scale-up of{" "}
+            <code>1 / (1 − 2·crop)</code> so the rotated/translated edges
+            don't reveal the canvas background.
           </li>
         </ul>
         <h4>Caveats</h4>
         <p>
-          Translation only in v1 — whip-pans and rolling-shutter wobble
-          still show. Affine (rotation + scale) and a proper L1-optimal
-          path solver are next on the list.
+          No proper L1-optimal path solver yet — Gaussian + median is much
+          smaller code with similar visual results for typical hand-held
+          shake. Rolling-shutter wobble (CMOS skew on whip-pans) needs
+          per-row correction and is out of scope for v1.
         </p>
         <h4>Papers</h4>
         <ul>
@@ -583,16 +608,22 @@ export default function App() {
               target="_blank"
               rel="noopener noreferrer"
             >
-              Auto-Directed Video Stabilization with Robust L1 Optimal
-              Camera Paths (CVPR)
+              Auto-Directed Video Stabilization with Robust L1 Optimal Camera
+              Paths (CVPR)
             </a>
-            . The reference for what production-grade stabilisation looks
-            like; we ship a simpler Gaussian-smoothed variant.
+            . Reference for production-grade stabilisation.
           </li>
           <li>
-            Lucas-Kanade & related feature-tracking literature underlies
-            the approach; this app uses block-matching instead to keep the
-            bundle small.
+            Umeyama (1991) —{" "}
+            <a
+              href="https://web.stanford.edu/class/cs273/refs/umeyama.pdf"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Least-Squares Estimation of Transformation Parameters Between
+              Two Point Patterns (IEEE TPAMI)
+            </a>
+            . The closed-form similarity-transform fit used per frame.
           </li>
         </ul>
         <h4>Source</h4>
@@ -603,8 +634,7 @@ export default function App() {
             rel="noopener noreferrer"
           >
             github.com/majdyz/video
-          </a>{" "}
-          — both apps live in the same repo.
+          </a>
         </p>
       </Modal>
 
@@ -635,6 +665,13 @@ export default function App() {
           />
         )}
         {mode === "video" && isPaused && !recording && <PlayOverlay />}
+        {mode === "video" && analysisReady && !recording && (
+          <CompareButton
+            active={showOriginal}
+            onPress={() => setShowOriginal(true)}
+            onRelease={() => setShowOriginal(false)}
+          />
+        )}
       </div>
 
       {mode === "video" && (

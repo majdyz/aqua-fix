@@ -1,29 +1,49 @@
-// Translation-only video stabilizer.
+// Similarity-transform video stabilizer.
 //
 // Pipeline:
-//   1. Play the source video with playbackRate=2 (muted) and capture each
-//      decoded frame via requestVideoFrameCallback. Falls back to rAF when
-//      rVFC is unavailable.
-//   2. Downsample each frame to a tiny grayscale thumbnail.
-//   3. For consecutive thumbnails, find the integer (dx, dy) shift that
-//      minimises sum-of-absolute-differences over their overlap, search
-//      window +/- MAX_SHIFT.
-//   4. Refine to sub-pixel using parabolic interpolation on the 3 SAD samples
-//      around the integer minimum, separately along x and y.
-//   5. Scale up by source/thumb ratio and accumulate to get the camera path.
+//   1. Play the source muted at 2x and capture each decoded frame via
+//      requestVideoFrameCallback (rAF fallback). Downsample each frame to a
+//      128x72 grayscale thumbnail.
+//   2. Track a 4x3 grid of points across consecutive thumbnails using small
+//      patch-based block matching with sub-pixel parabolic refinement.
+//   3. Reject outliers via residual-based trimming, then fit a similarity
+//      transform (translation + rotation + uniform scale) using a closed-form
+//      least-squares solution (Umeyama 1991, simplified for 2D similarity).
+//   4. Compose per-frame transforms into a cumulative camera path.
+//   5. Smoothing is applied separately at render time.
 //
-// Smoothing is applied separately at render time so the slider can change
-// without re-running analysis.
+// Smoothing supports up to sigma 240 frames (~8 seconds at 30Hz) for very
+// locked-down looks, and an optional median pre-pass on each path component
+// to absorb tracking outliers before Gaussian blur.
 //
-// We deliberately avoid jsfeat / OpenCV.js to keep the bundle tiny.
+// This is a Grundmann-Kwatra-Essa-style pipeline minus the L1-optimal path
+// solver — Gaussian + median is much smaller code with similar visual results
+// for most footage.
 
 const THUMB_W = 128;
 const THUMB_H = 72;
 const MAX_SHIFT = 16;
+const PATCH_R = 6; // patch half-width for feature matching (13x13)
+const GRID_X = 4;
+const GRID_Y = 3;
+
+export type SimilarityTransform = {
+  // Rotation+uniform-scale matrix entries (a = s·cos θ, b = s·sin θ) plus
+  // translation. The full 2D map is: x' = a·x − b·y + tx, y' = b·x + a·y + ty.
+  a: number;
+  b: number;
+  tx: number;
+  ty: number;
+};
 
 export type AnalysisResult = {
-  cumX: Float32Array;
-  cumY: Float32Array;
+  // Cumulative path: per-frame transforms expressed as the absolute
+  // similarity that takes frame[0]'s coordinate frame to frame[i]'s.
+  // Storing each component as a Float32Array makes Gaussian smoothing trivial.
+  cumA: Float32Array;
+  cumB: Float32Array;
+  cumTX: Float32Array;
+  cumTY: Float32Array;
   frameCount: number;
   frameRate: number;
 };
@@ -52,7 +72,6 @@ export async function analyzeVideo(
   thumbCtx.imageSmoothingEnabled = true;
   thumbCtx.imageSmoothingQuality = "medium";
 
-  // Make sure the decoder has at least one frame ready before we kick play().
   if (video.readyState < 2) {
     await new Promise<void>((resolve) => {
       const onReady = () => {
@@ -70,16 +89,13 @@ export async function analyzeVideo(
   const wasLoop = video.loop;
   const wasRate = video.playbackRate;
 
-  video.muted = true; // muted autoplay is allowed everywhere
+  video.muted = true;
   video.loop = false;
-  // 2x is the widely supported speed-up; iOS Safari is reliable up to here.
-  // The actual frame rate the encoder produces is unchanged.
   try {
     video.playbackRate = 2;
   } catch {
-    // some browsers cap it silently — that's fine
+    // ignore
   }
-
   if (video.currentTime > 0.05) {
     await seekToStart(video);
   }
@@ -87,10 +103,24 @@ export async function analyzeVideo(
   const scaleX = srcW / THUMB_W;
   const scaleY = srcH / THUMB_H;
 
-  const thumbsX: number[] = [0];
-  const thumbsY: number[] = [0];
-  let cumX = 0;
-  let cumY = 0;
+  // Grid of feature centres on the thumbnail. Avoids the very edge so the
+  // patch fits inside the frame with the search window extended.
+  const features: { x: number; y: number }[] = [];
+  for (let gy = 0; gy < GRID_Y; gy++) {
+    for (let gx = 0; gx < GRID_X; gx++) {
+      features.push({
+        x: Math.round(((gx + 1) * THUMB_W) / (GRID_X + 1)),
+        y: Math.round(((gy + 1) * THUMB_H) / (GRID_Y + 1)),
+      });
+    }
+  }
+
+  const cumAArr: number[] = [1];
+  const cumBArr: number[] = [0];
+  const cumTXArr: number[] = [0];
+  const cumTYArr: number[] = [0];
+  // Cumulative transform state.
+  let cumA = 1, cumB = 0, cumTX = 0, cumTY = 0;
   let prevThumb: Uint8Array | null = null;
 
   const v = video as VideoWithRVFC;
@@ -101,23 +131,11 @@ export async function analyzeVideo(
     let watchdog: number | null = null;
 
     const restore = () => {
-      try {
-        video.pause();
-      } catch {
-        // ignore
-      }
+      try { video.pause(); } catch { /* */ }
       video.muted = wasMuted;
       video.loop = wasLoop;
-      try {
-        video.playbackRate = wasRate;
-      } catch {
-        // ignore
-      }
-      try {
-        video.currentTime = resumeAt;
-      } catch {
-        // ignore
-      }
+      try { video.playbackRate = wasRate; } catch { /* */ }
+      try { video.currentTime = resumeAt; } catch { /* */ }
       if (!wasPaused) video.play().catch(() => undefined);
     };
 
@@ -128,9 +146,11 @@ export async function analyzeVideo(
       restore();
       onProgress(1);
       resolve({
-        cumX: Float32Array.from(thumbsX),
-        cumY: Float32Array.from(thumbsY),
-        frameCount: thumbsX.length,
+        cumA: Float32Array.from(cumAArr),
+        cumB: Float32Array.from(cumBArr),
+        cumTX: Float32Array.from(cumTXArr),
+        cumTY: Float32Array.from(cumTYArr),
+        frameCount: cumAArr.length,
         frameRate: 30,
       });
     };
@@ -149,16 +169,30 @@ export async function analyzeVideo(
         thumbCtx.drawImage(video, 0, 0, THUMB_W, THUMB_H);
         const img = thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H);
         const gray = toGray(img.data, THUMB_W, THUMB_H);
+
         if (prevThumb) {
-          const { dx, dy } = blockMatch(prevThumb, gray, THUMB_W, THUMB_H, MAX_SHIFT);
-          cumX += dx * scaleX;
-          cumY += dy * scaleY;
+          const t = trackAndFit(prevThumb, gray, features, scaleX, scaleY);
+          // Compose: cum = cum ∘ t  (apply current frame-to-frame on top of cumulative)
+          const newA = cumA * t.a - cumB * t.b;
+          const newB = cumA * t.b + cumB * t.a;
+          const newTX = cumA * t.tx - cumB * t.ty + cumTX;
+          const newTY = cumB * t.tx + cumA * t.ty + cumTY;
+          cumA = newA;
+          cumB = newB;
+          cumTX = newTX;
+          cumTY = newTY;
         }
-        thumbsX.push(cumX);
-        thumbsY.push(cumY);
+        cumAArr.push(cumA);
+        cumBArr.push(cumB);
+        cumTXArr.push(cumTX);
+        cumTYArr.push(cumTY);
         prevThumb = gray;
       } catch {
-        // Skip frame on transient draw error; keep the path consistent.
+        // Repeat last cumulative on draw error so indexing stays consistent.
+        cumAArr.push(cumA);
+        cumBArr.push(cumB);
+        cumTXArr.push(cumTX);
+        cumTYArr.push(cumTY);
       }
       onProgress(Math.min(1, video.currentTime / duration));
     };
@@ -168,11 +202,8 @@ export async function analyzeVideo(
       const onFrame = () => {
         if (finished) return;
         processFrame();
-        if (video.ended) {
-          finish();
-        } else {
-          v.requestVideoFrameCallback?.(onFrame);
-        }
+        if (video.ended) finish();
+        else v.requestVideoFrameCallback?.(onFrame);
       };
       v.requestVideoFrameCallback?.(onFrame);
     } else {
@@ -190,8 +221,6 @@ export async function analyzeVideo(
     video
       .play()
       .then(() => {
-        // Watchdog: if currentTime doesn't advance for 5s, the decoder has
-        // stalled — better to surface a real error than spin at 0% forever.
         lastWatchdogTime = video.currentTime;
         watchdog = window.setInterval(() => {
           if (finished) return;
@@ -242,46 +271,42 @@ function toGray(rgba: Uint8ClampedArray, w: number, h: number): Uint8Array {
   return out;
 }
 
-function sad(
+// Match a small patch from `prev` centred on (cx, cy) into `curr`. Searches
+// integer offsets in [-MAX_SHIFT, +MAX_SHIFT]^2, then refines to sub-pixel
+// using parabolic fit on the SAD samples around the integer minimum.
+function matchPatch(
   prev: Uint8Array,
   curr: Uint8Array,
+  cx: number,
+  cy: number,
   w: number,
   h: number,
-  sx: number,
-  sy: number,
-): number {
-  const x0 = Math.max(0, sx);
-  const y0 = Math.max(0, sy);
-  const x1 = Math.min(w, w + sx);
-  const y1 = Math.min(h, h + sy);
-  let sum = 0;
-  let count = 0;
-  const stride = 2;
-  for (let y = y0; y < y1; y += stride) {
-    const prevRow = y * w;
-    const currRow = (y - sy) * w - sx;
-    for (let x = x0; x < x1; x += stride) {
-      const d = prev[prevRow + x] - curr[currRow + x];
-      sum += d < 0 ? -d : d;
-      count++;
-    }
-  }
-  return count > 0 ? sum / count : Number.POSITIVE_INFINITY;
-}
+): { dx: number; dy: number; conf: number } | null {
+  const r = PATCH_R;
+  if (cx - r - MAX_SHIFT < 0 || cx + r + MAX_SHIFT >= w) return null;
+  if (cy - r - MAX_SHIFT < 0 || cy + r + MAX_SHIFT >= h) return null;
 
-export function blockMatch(
-  prev: Uint8Array,
-  curr: Uint8Array,
-  w: number,
-  h: number,
-  maxShift: number,
-): { dx: number; dy: number } {
+  const patchSad = (sx: number, sy: number): number => {
+    let sum = 0;
+    for (let dy = -r; dy <= r; dy++) {
+      const py = cy + dy;
+      const cyy = cy + dy + sy;
+      const prevRow = py * w;
+      const currRow = cyy * w;
+      for (let dx = -r; dx <= r; dx++) {
+        const d = prev[prevRow + cx + dx] - curr[currRow + cx + dx + sx];
+        sum += d < 0 ? -d : d;
+      }
+    }
+    return sum;
+  };
+
   let bestSad = Number.POSITIVE_INFINITY;
   let bestX = 0;
   let bestY = 0;
-  for (let sy = -maxShift; sy <= maxShift; sy++) {
-    for (let sx = -maxShift; sx <= maxShift; sx++) {
-      const s = sad(prev, curr, w, h, sx, sy);
+  for (let sy = -MAX_SHIFT; sy <= MAX_SHIFT; sy++) {
+    for (let sx = -MAX_SHIFT; sx <= MAX_SHIFT; sx++) {
+      const s = patchSad(sx, sy);
       if (s < bestSad) {
         bestSad = s;
         bestX = sx;
@@ -290,27 +315,163 @@ export function blockMatch(
     }
   }
 
+  // Sub-pixel parabolic refine.
   let refX = bestX;
   let refY = bestY;
-  if (bestX > -maxShift && bestX < maxShift) {
-    const sm = sad(prev, curr, w, h, bestX - 1, bestY);
-    const sp = sad(prev, curr, w, h, bestX + 1, bestY);
+  if (bestX > -MAX_SHIFT && bestX < MAX_SHIFT) {
+    const sm = patchSad(bestX - 1, bestY);
+    const sp = patchSad(bestX + 1, bestY);
     const denom = sm - 2 * bestSad + sp;
     if (denom > 1e-6) {
       const off = (0.5 * (sm - sp)) / denom;
       if (Math.abs(off) < 1) refX = bestX + off;
     }
   }
-  if (bestY > -maxShift && bestY < maxShift) {
-    const sm = sad(prev, curr, w, h, bestX, bestY - 1);
-    const sp = sad(prev, curr, w, h, bestX, bestY + 1);
+  if (bestY > -MAX_SHIFT && bestY < MAX_SHIFT) {
+    const sm = patchSad(bestX, bestY - 1);
+    const sp = patchSad(bestX, bestY + 1);
     const denom = sm - 2 * bestSad + sp;
     if (denom > 1e-6) {
       const off = (0.5 * (sm - sp)) / denom;
       if (Math.abs(off) < 1) refY = bestY + off;
     }
   }
-  return { dx: refX, dy: refY };
+
+  // Confidence proxy: how distinct is the minimum from its neighbour?
+  // If the patch is on a low-texture region the SAD landscape is almost flat
+  // and we'd rather drop this match than trust it.
+  const sN = patchSad(bestX + 2, bestY) + patchSad(bestX - 2, bestY) +
+             patchSad(bestX, bestY + 2) + patchSad(bestX, bestY - 2);
+  const conf = (sN / 4 - bestSad) / (bestSad + 1);
+
+  return { dx: refX, dy: refY, conf };
+}
+
+// Track the grid into the current frame, fit a 2D similarity transform from
+// the inlier matches. Returns identity if too few inliers — so a momentarily
+// dropped frame doesn't perturb the cumulative path.
+function trackAndFit(
+  prev: Uint8Array,
+  curr: Uint8Array,
+  features: { x: number; y: number }[],
+  scaleX: number,
+  scaleY: number,
+): SimilarityTransform {
+  type Match = { px: number; py: number; qx: number; qy: number };
+  const matches: Match[] = [];
+  const confidences: number[] = [];
+
+  for (const f of features) {
+    const m = matchPatch(prev, curr, f.x, f.y, THUMB_W, THUMB_H);
+    if (!m) continue;
+    if (m.conf < 0.04) continue;
+    matches.push({ px: f.x, py: f.y, qx: f.x + m.dx, qy: f.y + m.dy });
+    confidences.push(m.conf);
+  }
+
+  if (matches.length < 3) return { a: 1, b: 0, tx: 0, ty: 0 };
+
+  // Initial similarity fit on all matches.
+  let fit = fitSimilarity(matches);
+  if (!fit) return { a: 1, b: 0, tx: 0, ty: 0 };
+
+  // Trim outliers — drop the matches with the worst residuals (top ~25% or
+  // residuals above a fixed threshold) and re-fit.
+  const residuals = matches.map((m) => {
+    const ex = fit!.a * m.px - fit!.b * m.py + fit!.tx - m.qx;
+    const ey = fit!.b * m.px + fit!.a * m.py + fit!.ty - m.qy;
+    return Math.sqrt(ex * ex + ey * ey);
+  });
+  const sorted = residuals.slice().sort((x, y) => x - y);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const threshold = Math.max(1.5, median * 2.5);
+  const inliers = matches.filter((_, i) => residuals[i] <= threshold);
+
+  if (inliers.length >= 3) {
+    const refined = fitSimilarity(inliers);
+    if (refined) fit = refined;
+  }
+
+  // Convert thumbnail-space transform to source-space. Translation scales by
+  // the source/thumb ratio. Rotation + uniform scale (a, b) are dimensionless
+  // and apply identically. The ratio between scaleX and scaleY is small for
+  // typical 16:9 footage, so use the average for a "uniform" scale-up.
+  const avgScale = (scaleX + scaleY) * 0.5;
+  return {
+    a: fit.a,
+    b: fit.b,
+    tx: fit.tx * avgScale,
+    ty: fit.ty * avgScale,
+  };
+}
+
+// Closed-form 2D similarity fit by least squares.
+// Solves for (a, b, tx, ty) minimising sum |q - T(p)|^2 over matches, where
+//   T(p) = (a·px - b·py + tx, b·px + a·py + ty).
+// Decomposed: subtract centroids so tx/ty drop out, fit (a, b), then recover
+// tx/ty.
+function fitSimilarity(
+  matches: { px: number; py: number; qx: number; qy: number }[],
+): SimilarityTransform | null {
+  const n = matches.length;
+  if (n < 2) return null;
+  let pcx = 0, pcy = 0, qcx = 0, qcy = 0;
+  for (const m of matches) {
+    pcx += m.px;
+    pcy += m.py;
+    qcx += m.qx;
+    qcy += m.qy;
+  }
+  pcx /= n; pcy /= n; qcx /= n; qcy /= n;
+
+  // Centred coords. Solve for (a, b):
+  //   sum (a·px - b·py - qx)·px + (b·px + a·py - qy)·py = 0
+  //   sum -(a·px - b·py - qx)·py + (b·px + a·py - qy)·px = 0
+  // After centring, this reduces to:
+  //   a · sum(px² + py²) = sum(px·qx + py·qy)
+  //   b · sum(px² + py²) = sum(px·qy − py·qx)
+  let sumP2 = 0;
+  let crossA = 0;
+  let crossB = 0;
+  for (const m of matches) {
+    const dpx = m.px - pcx;
+    const dpy = m.py - pcy;
+    const dqx = m.qx - qcx;
+    const dqy = m.qy - qcy;
+    sumP2 += dpx * dpx + dpy * dpy;
+    crossA += dpx * dqx + dpy * dqy;
+    crossB += dpx * dqy - dpy * dqx;
+  }
+  if (sumP2 < 1e-6) return null;
+  const a = crossA / sumP2;
+  const b = crossB / sumP2;
+  // Recover translation.
+  const tx = qcx - (a * pcx - b * pcy);
+  const ty = qcy - (b * pcx + a * pcy);
+  return { a, b, tx, ty };
+}
+
+// Median filter over a 1D path. Removes spikes from a single bad frame
+// before Gaussian smoothing softens the rest.
+export function medianFilter(arr: Float32Array, radius: number): Float32Array {
+  if (radius < 1) return arr.slice();
+  const n = arr.length;
+  const out = new Float32Array(n);
+  const buf = new Float32Array(radius * 2 + 1);
+  for (let i = 0; i < n; i++) {
+    let count = 0;
+    for (let k = -radius; k <= radius; k++) {
+      let idx = i + k;
+      if (idx < 0) idx = -idx;
+      if (idx >= n) idx = 2 * (n - 1) - idx;
+      if (idx < 0) idx = 0;
+      buf[count++] = arr[idx];
+    }
+    const view = buf.subarray(0, count);
+    view.sort();
+    out[i] = view[count >> 1];
+  }
+  return out;
 }
 
 export function gaussianSmooth(arr: Float32Array, sigma: number): Float32Array {
@@ -342,12 +503,83 @@ export function gaussianSmooth(arr: Float32Array, sigma: number): Float32Array {
   return out;
 }
 
+// Smooth the cumulative path: median pre-filter to absorb tracking spikes,
+// then Gaussian to mimic a smooth professional camera move. Maps slider 0..1
+// to a much wider sigma range (4..240 frames at 30Hz, i.e. 0.13s..8s).
+export function smoothPath(
+  result: AnalysisResult,
+  smoothing: number,
+): {
+  smoothA: Float32Array;
+  smoothB: Float32Array;
+  smoothTX: Float32Array;
+  smoothTY: Float32Array;
+} {
+  const sigma = sigmaForSmoothing(smoothing);
+  // Light median pre-pass; radius scales with sigma but is capped.
+  const medRadius = Math.min(5, Math.max(1, Math.round(sigma / 12)));
+  const aMed = medianFilter(result.cumA, medRadius);
+  const bMed = medianFilter(result.cumB, medRadius);
+  const txMed = medianFilter(result.cumTX, medRadius);
+  const tyMed = medianFilter(result.cumTY, medRadius);
+  return {
+    smoothA: gaussianSmooth(aMed, sigma),
+    smoothB: gaussianSmooth(bMed, sigma),
+    smoothTX: gaussianSmooth(txMed, sigma),
+    smoothTY: gaussianSmooth(tyMed, sigma),
+  };
+}
+
 export function sigmaForSmoothing(smoothing: number): number {
   const s = Math.max(0, Math.min(1, smoothing));
-  return 1 + s * 59;
+  // Quadratic ramp so the slider has fine control near the low end.
+  return 4 + (s * s) * 236;
 }
 
 export function frameIndexForTime(result: AnalysisResult, time: number): number {
   const idx = Math.round(time * result.frameRate);
   return Math.max(0, Math.min(result.frameCount - 1, idx));
+}
+
+// Inverse residual transform: the transform that takes the wobbly "raw" frame
+// to the smoothed virtual camera. We compose: stabilized = smoothed ∘ raw⁻¹.
+// Returns parameters for ctx.setTransform(a, b, c, d, e, f) where the matrix
+// maps the source frame coordinates to the canvas coordinates. The 2D affine
+// (a, b, c, d, e, f) form of a similarity transform with a = sCosθ, b = sSinθ
+// is (a, b, -b, a, tx, ty).
+export function residualTransform(
+  result: AnalysisResult,
+  smooth: ReturnType<typeof smoothPath>,
+  frame: number,
+): SimilarityTransform {
+  // raw similarity at this frame
+  const ra = result.cumA[frame];
+  const rb = result.cumB[frame];
+  const rtx = result.cumTX[frame];
+  const rty = result.cumTY[frame];
+  // smooth similarity at this frame
+  const sa = smooth.smoothA[frame];
+  const sb = smooth.smoothB[frame];
+  const stx = smooth.smoothTX[frame];
+  const sty = smooth.smoothTY[frame];
+
+  // residual = smooth ∘ raw⁻¹
+  // raw⁻¹ has params:
+  //   denom = ra² + rb²
+  //   ia =  ra / denom
+  //   ib = -rb / denom
+  //   itx = -(ia·rtx - ib·rty)
+  //   ity = -(ib·rtx + ia·rty)
+  const denom = ra * ra + rb * rb;
+  if (denom < 1e-9) return { a: 1, b: 0, tx: 0, ty: 0 };
+  const ia = ra / denom;
+  const ib = -rb / denom;
+  const itx = -(ia * rtx - ib * rty);
+  const ity = -(ib * rtx + ia * rty);
+  // smooth ∘ inverse(raw)
+  const a = sa * ia - sb * ib;
+  const b = sa * ib + sb * ia;
+  const tx = sa * itx - sb * ity + stx;
+  const ty = sb * itx + sa * ity + sty;
+  return { a, b, tx, ty };
 }
