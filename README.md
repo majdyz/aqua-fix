@@ -5,9 +5,11 @@ Two on-device PWAs for diver-shot footage, in one monorepo.
 - **Aqua Fix** · https://majdyz.github.io/video/aqua-fix/ — underwater colour
   correction (Ancuti compensation + Shades-of-Gray WB + CLAHE-style tone
   equalisation, optional Lightroom .cube LUT).
-- **Motion Fix** · https://majdyz.github.io/video/motion-fix/ — translation
-  stabilisation (block-matching on a 128×72 luma thumbnail + Gaussian path
-  smoothing).
+- **Motion Fix** · https://majdyz.github.io/video/motion-fix/ — similarity
+  stabilisation (translation + rotation + uniform scale). Multi-point grid
+  tracking on 128×72 luma thumbnails, Umeyama similarity fit, then
+  L1-optimal path smoothing via ADMM (the Grundmann-Kwatra-Essa formulation,
+  pentadiagonal banded Cholesky, in-bundle, no LP solver dependency).
 - Landing page · https://majdyz.github.io/video/
 
 Both run entirely in the browser, install as standalone PWAs, and process
@@ -38,12 +40,19 @@ Safari's MediaRecorder ceiling).
 - Grundmann, Kwatra & Essa (2011) —
   [Auto-Directed Video Stabilization with Robust L1 Optimal Camera Paths](https://research.google.com/pubs/archive/37041.pdf)
   (CVPR). The Google/YouTube stabiliser: feature tracking + motion
-  estimation + L1-optimal smooth path. Motion Fix v1 ships a simpler
-  Gaussian-smoothed translation-only variant; the L1 path solver is
-  the natural next upgrade.
+  estimation + L1-optimal path. Motion Fix uses the same L1 first- and
+  second-difference penalty (jitter + acceleration) via an ADMM solver
+  shipped in-bundle — no LP-solver dependency. The full paper formulation
+  also weights a third derivative (jerk) and adds explicit
+  constant/linear/parabolic regime constraints via linear programming;
+  that's the natural next upgrade.
+- Umeyama (1991) —
+  [Least-Squares Estimation of Transformation Parameters Between Two Point Patterns](https://web.stanford.edu/class/cs273/refs/umeyama.pdf)
+  (IEEE TPAMI). Closed-form similarity-transform fit used per frame on
+  the inlier matches.
 - Lucas & Kanade (1981) — feature-tracking literature underlying the
-  optical-flow approach. We use brute-force block-matching on a low-res
-  thumbnail instead, to keep the bundle small.
+  optical-flow approach. We use patch-based block-matching at low
+  resolution instead, to keep the bundle small.
 
 The "How it works" button in each app's header opens a modal with the same
 explanation and links.
