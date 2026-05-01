@@ -7,6 +7,7 @@ import {
   createRecordingSink,
   FilePickerButton,
   Hero,
+  Modal,
   PlaceholderDropZone,
   PlayOverlay,
   pickBitrate,
@@ -62,6 +63,7 @@ export default function App() {
   const [recordTime, setRecordTime] = useState(0);
   const [analysisReady, setAnalysisReady] = useState(false);
   const [canRecord, setCanRecord] = useState(true);
+  const [showInfo, setShowInfo] = useState(false);
 
   useEffect(() => {
     cropRef.current = crop;
@@ -531,7 +533,80 @@ export default function App() {
         logo={<MotionFixLogo />}
         name={MOTION_FIX_BRAND.name}
         tagline={MOTION_FIX_BRAND.tagline}
+        onInfoClick={() => setShowInfo(true)}
       />
+      <Modal open={showInfo} onClose={() => setShowInfo(false)} title="How Motion Fix works">
+        <h4>Pipeline</h4>
+        <ul>
+          <li>
+            <b>Analysis pass</b> — play the video at <code>2×</code> speed
+            muted, capture each decoded frame via{" "}
+            <code>requestVideoFrameCallback</code>, downsample to a 128×72
+            grayscale thumbnail.
+          </li>
+          <li>
+            <b>Block-matching</b> — for each consecutive thumbnail pair,
+            find the integer <code>(dx, dy)</code> in <code>±16 px</code>{" "}
+            that minimises sum-of-absolute-differences over the overlap;
+            sub-pixel parabolic refine on the 3 SAD samples around the
+            minimum, separately along x and y.
+          </li>
+          <li>
+            <b>Path</b> — accumulate per-frame translations into a cumulative
+            camera path, scaled back to source resolution.
+          </li>
+          <li>
+            <b>Smoothing</b> — separable 1D Gaussian (mirror-padded) on
+            <code>cumX</code> / <code>cumY</code>; the slider maps to{" "}
+            <code>sigma 1..60</code> frames. Re-smoothing on slider change
+            is sub-millisecond — no re-analysis.
+          </li>
+          <li>
+            <b>Render</b> — residual <code>= cum − smoothed</code> applied
+            as a 2D canvas <code>setTransform()</code> with a uniform
+            scale-up (<code>1 / (1 − 2·crop)</code>) so the translated
+            edges don't reveal the canvas background.
+          </li>
+        </ul>
+        <h4>Caveats</h4>
+        <p>
+          Translation only in v1 — whip-pans and rolling-shutter wobble
+          still show. Affine (rotation + scale) and a proper L1-optimal
+          path solver are next on the list.
+        </p>
+        <h4>Papers</h4>
+        <ul>
+          <li>
+            Grundmann, Kwatra, Essa (2011) —{" "}
+            <a
+              href="https://research.google.com/pubs/archive/37041.pdf"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Auto-Directed Video Stabilization with Robust L1 Optimal
+              Camera Paths (CVPR)
+            </a>
+            . The reference for what production-grade stabilisation looks
+            like; we ship a simpler Gaussian-smoothed variant.
+          </li>
+          <li>
+            Lucas-Kanade & related feature-tracking literature underlies
+            the approach; this app uses block-matching instead to keep the
+            bundle small.
+          </li>
+        </ul>
+        <h4>Source</h4>
+        <p>
+          <a
+            href="https://github.com/majdyz/video"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            github.com/majdyz/video
+          </a>{" "}
+          — both apps live in the same repo.
+        </p>
+      </Modal>
 
       <div
         className={`stage ${mode === "idle" ? "is-empty" : ""}`}

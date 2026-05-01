@@ -9,6 +9,7 @@ import {
   createRecordingSink,
   FilePickerButton,
   Hero,
+  Modal,
   PlaceholderDropZone,
   PlayOverlay,
   PresetsRow,
@@ -108,6 +109,7 @@ export default function App() {
   const [canRecord, setCanRecord] = useState(true);
   const [lutName, setLutName] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [showInfo, setShowInfo] = useState(false);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -666,7 +668,99 @@ export default function App() {
     <div className="app">
       <div className="bg" aria-hidden="true" />
 
-      <Hero logo={<AquaFixLogo />} name={AQUA_FIX_BRAND.name} tagline={AQUA_FIX_BRAND.tagline} />
+      <Hero
+        logo={<AquaFixLogo />}
+        name={AQUA_FIX_BRAND.name}
+        tagline={AQUA_FIX_BRAND.tagline}
+        onInfoClick={() => setShowInfo(true)}
+      />
+      <Modal open={showInfo} onClose={() => setShowInfo(false)} title="How Aqua Fix works">
+        <h4>Pipeline</h4>
+        <p>
+          Each frame runs through a single WebGL fragment shader on-device:
+        </p>
+        <ul>
+          <li>
+            <b>Channel compensation</b> — lift the absorbed red and blue
+            channels using the green channel as a guide before any other
+            step. Prevents the purple cast naive white-balance produces on
+            red-deficient images.
+          </li>
+          <li>
+            <b>Shades-of-Gray white balance</b> — derive per-channel gains
+            from Minkowski p-norms (p=6) of the compensated image, clamped
+            to a safe range so deep blue scenes can be lifted without
+            blowout.
+          </li>
+          <li>
+            <b>Percentile stretch</b> — bound to <code>[0, 1]</code> with a
+            minimum span floor so flat scenes don't get over-amplified.
+          </li>
+          <li>
+            <b>CLAHE-style luminance equalisation</b> — histogram of the
+            BT.709 luma, clipped at 3% per bin, redistributed; the resulting
+            tone LUT rescales RGB by the <code>L_out / L_in</code> ratio so
+            colour balance is preserved while local contrast comes back.
+          </li>
+          <li>
+            <b>Optional Lightroom .cube LUT</b> — packed as a 2D-tiled 3D
+            texture, trilinear lookup in the shader.
+          </li>
+          <li>
+            <b>Adaptive tracking</b> — stats are re-sampled every ~1s and
+            EMA-blended at 15% so cast changes through a clip
+            (descent, scene cuts) are tracked without flicker.
+          </li>
+        </ul>
+        <h4>Papers</h4>
+        <ul>
+          <li>
+            Ancuti, Ancuti, De Vleeschouwer, Bekaert (2018) —{" "}
+            <a
+              href="https://ieeexplore.ieee.org/document/8059845"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Color Balance and Fusion for Underwater Image Enhancement (IEEE TIP)
+            </a>
+          </li>
+          <li>
+            Finlayson & Trezzi (2004) —{" "}
+            <a
+              href="https://ivrl.epfl.ch/wp-content/uploads/2018/08/Finlayson_2004.pdf"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Shades of Gray and Colour Constancy (CIC)
+            </a>
+          </li>
+          <li>
+            Pizer et al. (1987) — Adaptive Histogram Equalization and its
+            Variations (CLAHE)
+          </li>
+          <li>
+            Reference impl that informed defaults:{" "}
+            <a
+              href="https://github.com/bornfree/dive-color-corrector"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              bornfree/dive-color-corrector
+            </a>
+          </li>
+        </ul>
+        <h4>Source</h4>
+        <p>
+          <a
+            href="https://github.com/majdyz/video"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            github.com/majdyz/video
+          </a>{" "}
+          — both apps live in the same repo.
+        </p>
+      </Modal>
 
       <div
         className={`stage ${mode === "idle" ? "is-empty" : ""}`}

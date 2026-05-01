@@ -4,6 +4,51 @@
  */
 import { useEffect, useState, type ReactNode } from "react";
 
+export function InfoButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button className="info-btn" onClick={onClick} aria-label="How it works">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6" fill="none" />
+        <circle cx="12" cy="7.5" r="1.1" fill="currentColor" />
+        <path d="M12 11v6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      </svg>
+    </button>
+  );
+}
+
+export function Modal({
+  open,
+  onClose,
+  title,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-head">
+          <h3>{title}</h3>
+          <button onClick={onClose} aria-label="Close">×</button>
+        </header>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
 export function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const m = Math.floor(seconds / 60);
@@ -270,10 +315,12 @@ export function Hero({
   logo,
   name,
   tagline,
+  onInfoClick,
 }: {
   logo: ReactNode;
   name: string;
   tagline: string;
+  onInfoClick?: () => void;
 }) {
   return (
     <header className="hero">
@@ -281,10 +328,11 @@ export function Hero({
         <div className="logo" aria-hidden="true">
           {logo}
         </div>
-        <div>
+        <div className="brand-text">
           <h1>{name}</h1>
           <p className="tag">{tagline}</p>
         </div>
+        {onInfoClick && <InfoButton onClick={onInfoClick} />}
       </div>
     </header>
   );

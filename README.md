@@ -1,72 +1,91 @@
-# Aqua Fix
+# video — Aqua Fix + Motion Fix
 
-Underwater color correction in your browser. PWA — install to your iPhone home screen, works offline, runs entirely on-device (no upload).
+Two on-device PWAs for diver-shot footage, in one monorepo.
 
-Deployed at: https://majdyz.github.io/aqua-fix
+- **Aqua Fix** · https://majdyz.github.io/video/aqua-fix/ — underwater colour
+  correction (Ancuti compensation + Shades-of-Gray WB + CLAHE-style tone
+  equalisation, optional Lightroom .cube LUT).
+- **Motion Fix** · https://majdyz.github.io/video/motion-fix/ — translation
+  stabilisation (block-matching on a 128×72 luma thumbnail + Gaussian path
+  smoothing).
+- Landing page · https://majdyz.github.io/video/
 
-## What it does
+Both run entirely in the browser, install as standalone PWAs, and process
+video at native resolution (4K supported, capped at 30 Mbps to stay under
+Safari's MediaRecorder ceiling).
 
-Underwater photos lose red first, then orange, then yellow as depth increases. Aqua Fix runs each image through:
+## Algorithms — papers & references
 
-1. **Auto white balance** — per-channel histogram stretch (1st–99th percentile) restores the dynamic range water compressed.
-2. **Red channel boost** — adaptive add-back of `(B+G)/2 - R` where the red channel is weak.
-3. **Saturation** — gentle pop after the cast is removed.
+### Aqua Fix
 
-All three run in a WebGL fragment shader, so video preview stays at 60fps on a recent iPhone.
+- Ancuti, Ancuti, De Vleeschouwer & Bekaert (2018) —
+  [Color Balance and Fusion for Underwater Image Enhancement](https://ieeexplore.ieee.org/document/8059845)
+  (IEEE TIP). Channel-compensation + gray-world / multi-scale fusion pipeline;
+  the conceptual basis for the colour-correction shader here.
+- Finlayson & Trezzi (2004) —
+  [Shades of Gray and Colour Constancy](https://ivrl.epfl.ch/wp-content/uploads/2018/08/Finlayson_2004.pdf)
+  (CIC). The Minkowski p-norm white-balance estimator (p=6) used after
+  channel compensation.
+- Pizer et al. (1987) — Adaptive Histogram Equalization and its Variations.
+  CLAHE applied here as a **luminance-only** tone LUT (3% bin clipping,
+  excess redistributed) so contrast is enhanced without colour shift.
+- Reference implementation that informed the defaults:
+  [bornfree/dive-color-corrector](https://github.com/bornfree/dive-color-corrector)
+  — popular open Dive+-style implementation.
 
-## Modes
+### Motion Fix
 
-- **Photos**: pick or capture → live-preview correction → save corrected JPEG.
-- **Videos**: live preview only. iOS Safari's `MediaRecorder` is too inconsistent to reliably re-encode underwater video at full quality. Use a desktop tool for that step.
+- Grundmann, Kwatra & Essa (2011) —
+  [Auto-Directed Video Stabilization with Robust L1 Optimal Camera Paths](https://research.google.com/pubs/archive/37041.pdf)
+  (CVPR). The Google/YouTube stabiliser: feature tracking + motion
+  estimation + L1-optimal smooth path. Motion Fix v1 ships a simpler
+  Gaussian-smoothed translation-only variant; the L1 path solver is
+  the natural next upgrade.
+- Lucas & Kanade (1981) — feature-tracking literature underlying the
+  optical-flow approach. We use brute-force block-matching on a low-res
+  thumbnail instead, to keep the bundle small.
+
+The "How it works" button in each app's header opens a modal with the same
+explanation and links.
+
+## Repo layout
+
+```
+.
+├── apps/
+│   ├── aqua-fix/                 colour corrector — base /video/aqua-fix/
+│   └── motion-fix/               stabiliser     — base /video/motion-fix/
+├── packages/
+│   └── shared/                   reusable UI + recorder + theme
+├── scripts/
+│   └── assemble-dist.mjs         builds dist/<app>/ + landing index.html
+├── pnpm-workspace.yaml
+└── package.json                  root orchestrator + gh-pages deploy
+```
 
 ## Local development
 
 ```bash
 pnpm install
-pnpm dev
+pnpm dev:aqua    # starts apps/aqua-fix dev server
+pnpm dev:motion  # starts apps/motion-fix dev server
 ```
 
-Build & preview:
+Build everything and assemble for deploy:
 
 ```bash
 pnpm build
-pnpm preview
 ```
 
-## Deploy to GitHub Pages
-
-Same workflow as `chat-wa`:
+## Deploy
 
 ```bash
-# one-time: create the repo on GitHub
-gh repo create aqua-fix --public --source . --remote origin --push
-
-# every release
-pnpm deploy
+pnpm deploy   # runs pnpm build then gh-pages -d dist
 ```
 
-`pnpm deploy` runs `pnpm build` and pushes `dist/` to the `gh-pages` branch via the `gh-pages` package. In repo settings, set GitHub Pages to serve from the `gh-pages` branch.
-
-The Vite `base` is set to `/aqua-fix/` in `vite.config.ts` so all asset paths resolve correctly under the project subpath.
+The `gh-pages` branch is served at `https://majdyz.github.io/video/`.
 
 ## Install on iPhone
 
-1. Open https://majdyz.github.io/aqua-fix in Safari.
-2. Tap the Share icon.
-3. "Add to Home Screen".
-
-The app opens fullscreen, hides Safari's chrome, and works offline after the first load (service worker caches the bundle).
-
-## Project layout
-
-```
-src/
-  App.tsx            UI: file picker, canvas stage, sliders, save
-  lib/correct.ts     WebGL renderer + per-channel stats
-public/
-  manifest.webmanifest
-  sw.js              cache-first service worker
-  icon.svg           source icon (PNG variants generated at build)
-scripts/
-  build-icons.mjs    sharp-based PNG generation
-```
+Open the URL in Safari → Share → **Add to Home Screen**. Each app installs
+as a separate icon and launches fullscreen.

@@ -1,14 +1,16 @@
 // Translation-only video stabilizer.
 //
 // Pipeline:
-//   1. Walk the source video frame-by-frame, downsampling each frame to a tiny
-//      grayscale thumbnail.
-//   2. For consecutive thumbnails, find the integer (dx, dy) shift that
+//   1. Play the source video with playbackRate=2 (muted) and capture each
+//      decoded frame via requestVideoFrameCallback. Falls back to rAF when
+//      rVFC is unavailable.
+//   2. Downsample each frame to a tiny grayscale thumbnail.
+//   3. For consecutive thumbnails, find the integer (dx, dy) shift that
 //      minimises sum-of-absolute-differences over their overlap, search
 //      window +/- MAX_SHIFT.
-//   3. Refine to sub-pixel using parabolic interpolation on the 3 SAD samples
+//   4. Refine to sub-pixel using parabolic interpolation on the 3 SAD samples
 //      around the integer minimum, separately along x and y.
-//   4. Scale up by source/thumb ratio and accumulate to get the camera path.
+//   5. Scale up by source/thumb ratio and accumulate to get the camera path.
 //
 // Smoothing is applied separately at render time so the slider can change
 // without re-running analysis.
@@ -26,6 +28,10 @@ export type AnalysisResult = {
   frameRate: number;
 };
 
+type VideoWithRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: (now: number, metadata: unknown) => void) => number;
+};
+
 export async function analyzeVideo(
   video: HTMLVideoElement,
   onProgress: (p: number) => void,
@@ -34,7 +40,6 @@ export async function analyzeVideo(
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error("Video has no usable duration");
   }
-
   const srcW = video.videoWidth;
   const srcH = video.videoHeight;
   if (!srcW || !srcH) throw new Error("Video has no usable size");
@@ -47,120 +52,196 @@ export async function analyzeVideo(
   thumbCtx.imageSmoothingEnabled = true;
   thumbCtx.imageSmoothingQuality = "medium";
 
-  // Pause and reset the element — analysis owns it for the duration of the
-  // pass and we don't want autoplay racing with our seek loop.
+  // Make sure the decoder has at least one frame ready before we kick play().
+  if (video.readyState < 2) {
+    await new Promise<void>((resolve) => {
+      const onReady = () => {
+        video.removeEventListener("canplay", onReady);
+        resolve();
+      };
+      video.addEventListener("canplay", onReady);
+      setTimeout(resolve, 6000);
+    });
+  }
+
   const wasPaused = video.paused;
   const resumeAt = video.currentTime;
   const wasMuted = video.muted;
   const wasLoop = video.loop;
-  video.pause();
-  video.muted = true;
-  video.loop = false;
+  const wasRate = video.playbackRate;
 
-  // We sample on a fixed 30Hz grid regardless of the source frame rate so
-  // the smoothing-slider sigma (in frames) maps to a consistent time window.
-  const frameRate = 30;
+  video.muted = true; // muted autoplay is allowed everywhere
+  video.loop = false;
+  // 2x is the widely supported speed-up; iOS Safari is reliable up to here.
+  // The actual frame rate the encoder produces is unchanged.
+  try {
+    video.playbackRate = 2;
+  } catch {
+    // some browsers cap it silently — that's fine
+  }
+
+  if (video.currentTime > 0.05) {
+    await seekToStart(video);
+  }
 
   const scaleX = srcW / THUMB_W;
   const scaleY = srcH / THUMB_H;
 
-  const thumbsX: number[] = [];
-  const thumbsY: number[] = [];
+  const thumbsX: number[] = [0];
+  const thumbsY: number[] = [0];
   let cumX = 0;
   let cumY = 0;
-  thumbsX.push(0);
-  thumbsY.push(0);
-
   let prevThumb: Uint8Array | null = null;
 
-  const sampleStep = 1 / 30;
-  const totalFrames = Math.max(1, Math.floor(duration * 30));
+  const v = video as VideoWithRVFC;
 
-  for (let i = 0; i < totalFrames; i++) {
-    const t = Math.min(duration, i * sampleStep);
-    await seekTo(video, t);
-    thumbCtx.drawImage(video, 0, 0, THUMB_W, THUMB_H);
-    const img = thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H);
-    const gray = toGray(img.data, THUMB_W, THUMB_H);
+  return new Promise<AnalysisResult>((resolve, reject) => {
+    let finished = false;
+    let lastWatchdogTime = 0;
+    let watchdog: number | null = null;
 
-    if (prevThumb) {
-      const { dx, dy } = blockMatch(prevThumb, gray, THUMB_W, THUMB_H, MAX_SHIFT);
-      cumX += dx * scaleX;
-      cumY += dy * scaleY;
+    const restore = () => {
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+      video.muted = wasMuted;
+      video.loop = wasLoop;
+      try {
+        video.playbackRate = wasRate;
+      } catch {
+        // ignore
+      }
+      try {
+        video.currentTime = resumeAt;
+      } catch {
+        // ignore
+      }
+      if (!wasPaused) video.play().catch(() => undefined);
+    };
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (watchdog !== null) clearInterval(watchdog);
+      restore();
+      onProgress(1);
+      resolve({
+        cumX: Float32Array.from(thumbsX),
+        cumY: Float32Array.from(thumbsY),
+        frameCount: thumbsX.length,
+        frameRate: 30,
+      });
+    };
+
+    const fail = (err: Error) => {
+      if (finished) return;
+      finished = true;
+      if (watchdog !== null) clearInterval(watchdog);
+      restore();
+      reject(err);
+    };
+
+    const processFrame = () => {
+      if (video.readyState < 2) return;
+      try {
+        thumbCtx.drawImage(video, 0, 0, THUMB_W, THUMB_H);
+        const img = thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H);
+        const gray = toGray(img.data, THUMB_W, THUMB_H);
+        if (prevThumb) {
+          const { dx, dy } = blockMatch(prevThumb, gray, THUMB_W, THUMB_H, MAX_SHIFT);
+          cumX += dx * scaleX;
+          cumY += dy * scaleY;
+        }
+        thumbsX.push(cumX);
+        thumbsY.push(cumY);
+        prevThumb = gray;
+      } catch {
+        // Skip frame on transient draw error; keep the path consistent.
+      }
+      onProgress(Math.min(1, video.currentTime / duration));
+    };
+
+    const useRvfc = typeof v.requestVideoFrameCallback === "function";
+    if (useRvfc) {
+      const onFrame = () => {
+        if (finished) return;
+        processFrame();
+        if (video.ended) {
+          finish();
+        } else {
+          v.requestVideoFrameCallback?.(onFrame);
+        }
+      };
+      v.requestVideoFrameCallback?.(onFrame);
+    } else {
+      const loop = () => {
+        if (finished) return;
+        if (!video.paused && video.readyState >= 2) processFrame();
+        if (video.ended) finish();
+        else requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
     }
-    thumbsX.push(cumX);
-    thumbsY.push(cumY);
-    prevThumb = gray;
 
-    if (i % 4 === 0 || i === totalFrames - 1) {
-      onProgress((i + 1) / totalFrames);
-      // Yield so the UI can repaint the progress label.
-      await new Promise((r) => setTimeout(r, 0));
-    }
-  }
+    video.addEventListener("ended", finish, { once: true });
 
-  // Restore element state.
-  try {
-    video.currentTime = resumeAt;
-  } catch {
-    // ignore
-  }
-  video.muted = wasMuted;
-  video.loop = wasLoop;
-  if (!wasPaused) video.play().catch(() => undefined);
-
-  const frameCount = thumbsX.length;
-  const out: AnalysisResult = {
-    cumX: Float32Array.from(thumbsX),
-    cumY: Float32Array.from(thumbsY),
-    frameCount,
-    frameRate,
-  };
-  return out;
+    video
+      .play()
+      .then(() => {
+        // Watchdog: if currentTime doesn't advance for 5s, the decoder has
+        // stalled — better to surface a real error than spin at 0% forever.
+        lastWatchdogTime = video.currentTime;
+        watchdog = window.setInterval(() => {
+          if (finished) return;
+          if (video.currentTime <= lastWatchdogTime + 0.05) {
+            fail(new Error("Video decoder stalled during analysis"));
+            return;
+          }
+          lastWatchdogTime = video.currentTime;
+        }, 5000);
+      })
+      .catch((e) =>
+        fail(new Error("Couldn't play video for analysis: " + (e instanceof Error ? e.message : String(e)))),
+      );
+  });
 }
 
-function seekTo(video: HTMLVideoElement, t: number): Promise<void> {
-  return new Promise((resolve, reject) => {
+async function seekToStart(video: HTMLVideoElement): Promise<void> {
+  return new Promise<void>((resolve) => {
     let done = false;
     const onSeeked = () => {
       if (done) return;
       done = true;
       video.removeEventListener("seeked", onSeeked);
-      video.removeEventListener("error", onError);
       resolve();
     };
-    const onError = () => {
+    video.addEventListener("seeked", onSeeked);
+    try {
+      video.currentTime = 0;
+    } catch {
+      done = true;
+      video.removeEventListener("seeked", onSeeked);
+      resolve();
+    }
+    setTimeout(() => {
       if (done) return;
       done = true;
       video.removeEventListener("seeked", onSeeked);
-      video.removeEventListener("error", onError);
-      reject(new Error("Seek failed"));
-    };
-    video.addEventListener("seeked", onSeeked);
-    video.addEventListener("error", onError);
-    try {
-      // Tiny epsilon stops Safari short-circuiting an identical-time seek.
-      const target = Math.abs(video.currentTime - t) < 1e-4 ? t + 1e-4 : t;
-      video.currentTime = target;
-    } catch {
-      onError();
-    }
+      resolve();
+    }, 2000);
   });
 }
 
 function toGray(rgba: Uint8ClampedArray, w: number, h: number): Uint8Array {
   const out = new Uint8Array(w * h);
   for (let i = 0, j = 0; i < out.length; i++, j += 4) {
-    // Rec. 601 luma — fast and good enough for matching.
     out[i] = (rgba[j] * 77 + rgba[j + 1] * 150 + rgba[j + 2] * 29) >> 8;
   }
   return out;
 }
 
-// SAD over the overlap region for shift (sx, sy). prev is the reference,
-// curr is sampled at offsets (x+sx, y+sy). We sample on a stride to make
-// the search faster — full-pixel match isn't needed, we only need a clear
-// minimum to fit a parabola around.
 function sad(
   prev: Uint8Array,
   curr: Uint8Array,
@@ -209,8 +290,6 @@ export function blockMatch(
     }
   }
 
-  // Sub-pixel parabolic refine. Parabola through (s-1, s, s+1):
-  //   offset = 0.5 * (s_minus - s_plus) / (s_minus - 2*s + s_plus)
   let refX = bestX;
   let refY = bestY;
   if (bestX > -maxShift && bestX < maxShift) {
@@ -234,7 +313,6 @@ export function blockMatch(
   return { dx: refX, dy: refY };
 }
 
-// Separable 1D Gaussian, mirror-padded at the edges.
 export function gaussianSmooth(arr: Float32Array, sigma: number): Float32Array {
   const n = arr.length;
   if (n === 0 || sigma <= 0) return arr.slice();
@@ -264,17 +342,12 @@ export function gaussianSmooth(arr: Float32Array, sigma: number): Float32Array {
   return out;
 }
 
-// Maps the smoothing slider (0..1) to a Gaussian sigma in frames (1..60).
 export function sigmaForSmoothing(smoothing: number): number {
   const s = Math.max(0, Math.min(1, smoothing));
   return 1 + s * 59;
 }
 
-// Picks the integer index into cumX / cumY for a given playback time.
-export function frameIndexForTime(
-  result: AnalysisResult,
-  time: number,
-): number {
+export function frameIndexForTime(result: AnalysisResult, time: number): number {
   const idx = Math.round(time * result.frameRate);
   return Math.max(0, Math.min(result.frameCount - 1, idx));
 }
