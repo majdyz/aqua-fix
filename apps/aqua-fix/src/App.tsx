@@ -438,8 +438,11 @@ export default function App() {
   function maybeRefreshStats(video: HTMLVideoElement) {
     // Dynamic grading off → keep the first-frame stats frozen for
     // the whole clip. statsRef is set once in loadVideo and we just
-    // leave it alone here.
-    if (!dynamicGradeRef.current) return;
+    // leave it alone here. Also force-skip during recording: each
+    // refresh does a full source-resolution ImageData read (~33 MB
+    // at 4K) which competes with the encoder for memory/CPU budget
+    // and was implicated in long-record freezes.
+    if (!dynamicGradeRef.current || recordingFlagRef.current) return;
     const now = performance.now();
     // Refresh 4× per second instead of 1× — combined with a per-step
     // lerp 4× smaller, the effective time constant matches the previous
@@ -904,6 +907,25 @@ export default function App() {
     setError(null);
     previewActiveRef.current = false;
     recordingFlagRef.current = true;
+    // Strip optional work to maximise free memory for the encoder /
+    // decoder. iOS Safari's MediaRecorder budget is tight at 4K + 60
+    // fps; freeing every MB we can pushes the freeze point further
+    // down the timeline.
+    // - Cancel the entry-wipe rAF (likely already done but defensive).
+    // - Drop the photo bitmap (large; not needed for video record).
+    // - Stop dynamic grading recompute even if the user enabled it
+    //   (the per-250-ms computeStats off the source frame is ~aw·ah
+    //   ImageData reads, which on a 4K source is ~33 MB churn per
+    //   refresh — pure encoder competition during recording).
+    if (entryAnimRef.current !== null) {
+      cancelAnimationFrame(entryAnimRef.current);
+      entryAnimRef.current = null;
+      entryAnimSplitRef.current = null;
+    }
+    if (mode === "video" && imageBitmapRef.current) {
+      try { imageBitmapRef.current.close(); } catch { /* ignore */ }
+      imageBitmapRef.current = null;
+    }
     // Disable the compare wipe before recording — otherwise the saved
     // file is split (original on left, corrected on right) which is
     // never what the user wants in their final video.
@@ -1181,7 +1203,13 @@ export default function App() {
       startPreview();
       return;
     }
-    recorder.start(1000);
+    // 250 ms timeslice (was 1000 ms). MediaRecorder's internal encoder
+    // queue gets flushed 4× more often, which keeps the per-flush
+    // accumulated buffer smaller. Same total throughput, just less
+    // peak memory pressure — important on iOS Safari at 4K + 60 fps
+    // where the encoder's reference-frame pool + accumulated output
+    // was the prime suspect for the freeze around 28–51 s.
+    recorder.start(250);
   }
 
   function cancelRecording() {

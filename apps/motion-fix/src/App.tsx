@@ -1001,7 +1001,9 @@ export default function App() {
       startPreview();
       return;
     }
-    recorder.start(1000);
+    // 250 ms timeslice keeps the encoder's accumulated buffer smaller —
+    // see aqua-fix recordVideoInner for details.
+    recorder.start(250);
   }
 
   function cancelRecording() {
