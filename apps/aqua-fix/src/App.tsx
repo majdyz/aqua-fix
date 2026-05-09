@@ -1029,24 +1029,33 @@ export default function App() {
       }
     };
 
-    // Drive renders from requestVideoFrameCallback when available so we
-    // capture exactly one canvas frame per decoded video frame. The
-    // previous rAF loop ran at display refresh rate (~60Hz) regardless
-    // of whether the video had advanced, so on heavy 4K iPhone clips
-    // where the decoder paces below display refresh, the same frame
-    // got captured into the recording multiple times — the saved
-    // file looked frozen for stretches even though the source played
-    // through cleanly. rAF fallback for browsers without rVFC.
+    // Drive renders from requestVideoFrameCallback when available so
+    // we capture exactly one canvas frame per decoded video frame.
+    // The previous rAF loop ran at display refresh (~60Hz) regardless
+    // of whether the video advanced — heavy 4K clips produced saved
+    // files with stretches of frozen video. rAF fallback for browsers
+    // without rVFC. The chain is restartable so the stall watchdog
+    // can re-register it after a play() resume (rVFC chain dies when
+    // the video pauses, since the last callback never fires).
     const useRvfc = typeof video.requestVideoFrameCallback === "function";
-    if (useRvfc) {
+    let rvfcChainAlive = false;
+    const startRvfcChain = () => {
+      if (!useRvfc || rvfcChainAlive) return;
+      rvfcChainAlive = true;
       const onFrame = () => {
+        rvfcChainAlive = true;
         if (!recordingFlagRef.current) return;
         renderAndPush();
         if (!video.ended && recordingFlagRef.current) {
           video.requestVideoFrameCallback?.(onFrame);
+        } else {
+          rvfcChainAlive = false;
         }
       };
       video.requestVideoFrameCallback?.(onFrame);
+    };
+    if (useRvfc) {
+      startRvfcChain();
     } else {
       const loop = () => {
         if (!recordingFlagRef.current) return;
@@ -1056,14 +1065,13 @@ export default function App() {
       requestAnimationFrame(loop);
     }
 
-    // Stall detector: surface a clear error and stop the recording
-    // cleanly if the video element stops advancing for 10 s. Without
-    // this, an iOS Safari background-pause or decoder hang would let
-    // the recorder keep running with a frozen captureStream — the
-    // saved file would have a stretch of duplicated frames at the
-    // stall point. 10 s with a 0.1 s threshold and 2 strikes mirrors
-    // the analysis stall watchdog.
-    let recordingStallStrikes = 0;
+    // Stall detector: 5 s polling, single-strike — try a play() resume
+    // immediately and re-arm the rVFC chain. Surfaces an error only if
+    // play() rejects (truly dead decoder). Aggressive cadence because
+    // the prior 10 s × 2-strike (20 s effective) was longer than the
+    // user's tolerance — they reported a freeze at 28 s and the
+    // saved file kept duplicating that frame for many seconds before
+    // anything noticed.
     let recordingStallLastTime = 0;
     const stallWatchdog = window.setInterval(() => {
       if (!recordingFlagRef.current) {
@@ -1071,27 +1079,22 @@ export default function App() {
         return;
       }
       if (document.visibilityState !== "visible") {
-        recordingStallStrikes = 0;
         recordingStallLastTime = video.currentTime;
         return;
       }
-      if (video.currentTime <= recordingStallLastTime + 0.1) {
-        recordingStallStrikes++;
-        if (recordingStallStrikes >= 2) {
-          clearInterval(stallWatchdog);
-          // Try a play() resume first — Safari sometimes pauses on
-          // memory pressure but recovers on a re-issued play().
-          if (!video.ended) {
-            video.play().catch(() => {
-              setError("Recording stalled — exported video may be incomplete.");
-            });
-          }
-        }
-      } else {
-        recordingStallStrikes = 0;
+      if (video.currentTime <= recordingStallLastTime + 0.1 && !video.ended) {
+        // Stalled — try resume.
+        console.warn(`[record] video stalled at ${video.currentTime.toFixed(2)}s — attempting play()`);
+        video.play().then(() => {
+          // Re-arm rVFC since the old chain died when the video paused.
+          rvfcChainAlive = false;
+          startRvfcChain();
+        }).catch(() => {
+          setError("Recording stalled — exported video may be incomplete.");
+        });
       }
       recordingStallLastTime = video.currentTime;
-    }, 10000);
+    }, 5000);
 
     const stopAndDownload = () =>
       new Promise<void>((resolve) => {

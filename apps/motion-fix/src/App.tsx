@@ -863,21 +863,29 @@ export default function App() {
       }
     };
 
-    // Drive renders from rVFC when available so we capture exactly one
-    // canvas frame per decoded video frame. The previous rAF loop ran
-    // at display refresh rate regardless of whether the video had
-    // advanced — heavy 4K clips where the decoder paces below display
-    // refresh produced recordings with stretches of duplicated frames.
+    // Drive renders from rVFC when available so we capture exactly
+    // one canvas frame per decoded video frame. rAF fallback. Chain
+    // is restartable so the stall watchdog can re-register after a
+    // play() resume (rVFC chain dies when the video pauses).
     const useRvfcRecord = typeof video.requestVideoFrameCallback === "function";
-    if (useRvfcRecord) {
+    let rvfcChainAlive = false;
+    const startRvfcChain = () => {
+      if (!useRvfcRecord || rvfcChainAlive) return;
+      rvfcChainAlive = true;
       const onFrame = () => {
+        rvfcChainAlive = true;
         if (!recordingFlagRef.current) return;
         renderAndPush();
         if (!video.ended && recordingFlagRef.current) {
           video.requestVideoFrameCallback?.(onFrame);
+        } else {
+          rvfcChainAlive = false;
         }
       };
       video.requestVideoFrameCallback?.(onFrame);
+    };
+    if (useRvfcRecord) {
+      startRvfcChain();
     } else {
       const loop = () => {
         if (!recordingFlagRef.current) return;
@@ -887,12 +895,9 @@ export default function App() {
       requestAnimationFrame(loop);
     }
 
-    // Stall detector: surface an error and try a play() resume if the
-    // video stops advancing for ~10 s. Without this, an iOS Safari
-    // background-pause or decoder hang would let the recorder keep
-    // running with a frozen captureStream → recorded file gets a
-    // stretch of duplicated frames at the stall point.
-    let recordingStallStrikes = 0;
+    // Stall detector: 5 s polling, single-strike — try a play() resume
+    // immediately and re-arm the rVFC chain. Surfaces an error only
+    // if play() rejects (truly dead decoder).
     let recordingStallLastTime = 0;
     const stallWatchdog = window.setInterval(() => {
       if (!recordingFlagRef.current) {
@@ -900,25 +905,20 @@ export default function App() {
         return;
       }
       if (document.visibilityState !== "visible") {
-        recordingStallStrikes = 0;
         recordingStallLastTime = video.currentTime;
         return;
       }
-      if (video.currentTime <= recordingStallLastTime + 0.1) {
-        recordingStallStrikes++;
-        if (recordingStallStrikes >= 2) {
-          clearInterval(stallWatchdog);
-          if (!video.ended) {
-            video.play().catch(() => {
-              setError("Recording stalled — exported video may be incomplete.");
-            });
-          }
-        }
-      } else {
-        recordingStallStrikes = 0;
+      if (video.currentTime <= recordingStallLastTime + 0.1 && !video.ended) {
+        console.warn(`[record] video stalled at ${video.currentTime.toFixed(2)}s — attempting play()`);
+        video.play().then(() => {
+          rvfcChainAlive = false;
+          startRvfcChain();
+        }).catch(() => {
+          setError("Recording stalled — exported video may be incomplete.");
+        });
       }
       recordingStallLastTime = video.currentTime;
-    }, 10000);
+    }, 5000);
 
     const stopAndDownload = () =>
       new Promise<void>((resolve) => {
