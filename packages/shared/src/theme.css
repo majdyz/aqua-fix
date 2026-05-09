@@ -705,6 +705,35 @@ label.slider input[type="range"]::-moz-range-thumb {
 .adv-toggle svg { width: 14px; height: 14px; transition: transform 0.2s ease; }
 .adv-toggle svg.open { transform: rotate(180deg); }
 
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 2px;
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.checkbox-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+}
+.checkbox-row-hint {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 400;
+  line-height: 1.4;
+}
+
 .advanced {
   display: flex;
   flex-direction: column;

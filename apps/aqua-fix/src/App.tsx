@@ -159,6 +159,16 @@ export default function App() {
   // re-snap because the equality check was on object identity, not on a
   // reset signal.
   const statsRealRef = useRef(false);
+  // Dynamic grading: when on, recompute white-balance / mean / min-max
+  // stats per ~250 ms and lerp into the current stats. When off, the
+  // first-frame stats stay frozen for the whole clip — picks the look
+  // from the opening shot and never re-balances. Off by default because
+  // dynamic re-grading can lurch when a fish swims in or the camera
+  // pans into a different colour zone, turning a good frame red. Live
+  // ref so the per-frame loop reads the latest value without rebinding.
+  const dynamicGradeRef = useRef(false);
+  const [dynamicGrade, setDynamicGrade] = useState(false);
+  useEffect(() => { dynamicGradeRef.current = dynamicGrade; }, [dynamicGrade]);
 
   const [mode, setMode] = useState<Mode>("idle");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -426,6 +436,10 @@ export default function App() {
   }
 
   function maybeRefreshStats(video: HTMLVideoElement) {
+    // Dynamic grading off → keep the first-frame stats frozen for
+    // the whole clip. statsRef is set once in loadVideo and we just
+    // leave it alone here.
+    if (!dynamicGradeRef.current) return;
     const now = performance.now();
     // Refresh 4× per second instead of 1× — combined with a per-step
     // lerp 4× smaller, the effective time constant matches the previous
@@ -1451,6 +1465,24 @@ export default function App() {
 
             {quality === "classical" && (
             <AdvancedDisclosure disabled={recording}>
+              {mode === "video" && (
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={dynamicGrade}
+                    disabled={recording}
+                    onChange={(e) => setDynamicGrade(e.target.checked)}
+                  />
+                  <span className="checkbox-row-label">
+                    <span>Dynamic grading</span>
+                    <span className="checkbox-row-hint">
+                      Re-balance white-point as the scene changes. Off by
+                      default — can suddenly tint a good frame red when a
+                      fish swims through or the camera pans.
+                    </span>
+                  </span>
+                </label>
+              )}
               <div className="lut-picker">
                 {lutName ? (
                   <div className="lut-chip">
