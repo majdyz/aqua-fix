@@ -863,12 +863,62 @@ export default function App() {
       }
     };
 
-    const loop = () => {
-      if (!recordingFlagRef.current) return;
-      renderAndPush();
-      if (!video.ended && recordingFlagRef.current) requestAnimationFrame(loop);
-    };
-    requestAnimationFrame(loop);
+    // Drive renders from rVFC when available so we capture exactly one
+    // canvas frame per decoded video frame. The previous rAF loop ran
+    // at display refresh rate regardless of whether the video had
+    // advanced — heavy 4K clips where the decoder paces below display
+    // refresh produced recordings with stretches of duplicated frames.
+    const useRvfcRecord = typeof video.requestVideoFrameCallback === "function";
+    if (useRvfcRecord) {
+      const onFrame = () => {
+        if (!recordingFlagRef.current) return;
+        renderAndPush();
+        if (!video.ended && recordingFlagRef.current) {
+          video.requestVideoFrameCallback?.(onFrame);
+        }
+      };
+      video.requestVideoFrameCallback?.(onFrame);
+    } else {
+      const loop = () => {
+        if (!recordingFlagRef.current) return;
+        renderAndPush();
+        if (!video.ended && recordingFlagRef.current) requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
+
+    // Stall detector: surface an error and try a play() resume if the
+    // video stops advancing for ~10 s. Without this, an iOS Safari
+    // background-pause or decoder hang would let the recorder keep
+    // running with a frozen captureStream → recorded file gets a
+    // stretch of duplicated frames at the stall point.
+    let recordingStallStrikes = 0;
+    let recordingStallLastTime = 0;
+    const stallWatchdog = window.setInterval(() => {
+      if (!recordingFlagRef.current) {
+        clearInterval(stallWatchdog);
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        recordingStallStrikes = 0;
+        recordingStallLastTime = video.currentTime;
+        return;
+      }
+      if (video.currentTime <= recordingStallLastTime + 0.1) {
+        recordingStallStrikes++;
+        if (recordingStallStrikes >= 2) {
+          clearInterval(stallWatchdog);
+          if (!video.ended) {
+            video.play().catch(() => {
+              setError("Recording stalled — exported video may be incomplete.");
+            });
+          }
+        }
+      } else {
+        recordingStallStrikes = 0;
+      }
+      recordingStallLastTime = video.currentTime;
+    }, 10000);
 
     const stopAndDownload = () =>
       new Promise<void>((resolve) => {

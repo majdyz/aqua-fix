@@ -1029,12 +1029,69 @@ export default function App() {
       }
     };
 
-    const loop = () => {
-      if (!recordingFlagRef.current) return;
-      renderAndPush();
-      if (!video.ended && recordingFlagRef.current) requestAnimationFrame(loop);
-    };
-    requestAnimationFrame(loop);
+    // Drive renders from requestVideoFrameCallback when available so we
+    // capture exactly one canvas frame per decoded video frame. The
+    // previous rAF loop ran at display refresh rate (~60Hz) regardless
+    // of whether the video had advanced, so on heavy 4K iPhone clips
+    // where the decoder paces below display refresh, the same frame
+    // got captured into the recording multiple times — the saved
+    // file looked frozen for stretches even though the source played
+    // through cleanly. rAF fallback for browsers without rVFC.
+    const useRvfc = typeof video.requestVideoFrameCallback === "function";
+    if (useRvfc) {
+      const onFrame = () => {
+        if (!recordingFlagRef.current) return;
+        renderAndPush();
+        if (!video.ended && recordingFlagRef.current) {
+          video.requestVideoFrameCallback?.(onFrame);
+        }
+      };
+      video.requestVideoFrameCallback?.(onFrame);
+    } else {
+      const loop = () => {
+        if (!recordingFlagRef.current) return;
+        renderAndPush();
+        if (!video.ended && recordingFlagRef.current) requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
+
+    // Stall detector: surface a clear error and stop the recording
+    // cleanly if the video element stops advancing for 10 s. Without
+    // this, an iOS Safari background-pause or decoder hang would let
+    // the recorder keep running with a frozen captureStream — the
+    // saved file would have a stretch of duplicated frames at the
+    // stall point. 10 s with a 0.1 s threshold and 2 strikes mirrors
+    // the analysis stall watchdog.
+    let recordingStallStrikes = 0;
+    let recordingStallLastTime = 0;
+    const stallWatchdog = window.setInterval(() => {
+      if (!recordingFlagRef.current) {
+        clearInterval(stallWatchdog);
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        recordingStallStrikes = 0;
+        recordingStallLastTime = video.currentTime;
+        return;
+      }
+      if (video.currentTime <= recordingStallLastTime + 0.1) {
+        recordingStallStrikes++;
+        if (recordingStallStrikes >= 2) {
+          clearInterval(stallWatchdog);
+          // Try a play() resume first — Safari sometimes pauses on
+          // memory pressure but recovers on a re-issued play().
+          if (!video.ended) {
+            video.play().catch(() => {
+              setError("Recording stalled — exported video may be incomplete.");
+            });
+          }
+        }
+      } else {
+        recordingStallStrikes = 0;
+      }
+      recordingStallLastTime = video.currentTime;
+    }, 10000);
 
     const stopAndDownload = () =>
       new Promise<void>((resolve) => {
