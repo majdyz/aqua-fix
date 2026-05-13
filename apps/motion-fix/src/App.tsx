@@ -807,6 +807,14 @@ export default function App() {
 
     const fps = sourceFpsRef.current;
     const captureCtx = buildCaptureContext(canvas, fps);
+    // ``CanvasCaptureMediaStreamTrack.requestFrame`` publishes the
+    // current canvas backbuffer as the next captured frame, decoupling
+    // the recording from captureStream's internal sampler clock. Feature-
+    // checked per call so older Safari without the API silently falls
+    // back to sampler-clock behaviour.
+    const captureVideoTrack = captureCtx.videoTrack as MediaStreamTrack & {
+      requestFrame?: () => void;
+    };
     if (!audioRoutingRef.current) audioRoutingRef.current = attachAudioRouting(video);
     const audioCapture = await captureAudioForRecording(audioRoutingRef.current);
     const stream = new MediaStream([
@@ -855,6 +863,11 @@ export default function App() {
       if (!recordingFlagRef.current || !videoRef.current) return;
       const v = videoRef.current;
       drawStabilizedFrame();
+      // Phase-lock the captured frame to this render so the sampler
+      // clock can't land between draws (stale-canvas dup) or beat the
+      // renderer (skipped frame). One requestFrame() ≡ one captured
+      // frame ≡ one rVFC render.
+      captureVideoTrack.requestFrame?.();
       const now = performance.now();
       if (now - lastUiPushAt > 250) {
         lastUiPushAt = now;

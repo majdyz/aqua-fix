@@ -56,15 +56,22 @@ type CaptureContext = {
 };
 
 export function buildCaptureContext(canvas: HTMLCanvasElement, fps = 60): CaptureContext {
-  // Active capture at the requested fps. Cap at 60 — the canvas update
-  // loop is rAF-driven (display refresh, typically 60–120 Hz), so
-  // captureStream(120) or (240) would pull the *same* rendered frame
-  // multiple times on most monitors and produce duplicated frames in
-  // the saved file (slo-mo source -> bloated identical-frames output).
-  // Passive mode (no fps argument) drops frames mid-record on iOS
-  // Safari, so we always pin a rate.
-  const captureFps = Math.min(60, fps);
-  const canvasStream = canvas.captureStream(captureFps);
+  // Pin the sampler to the detected source fps. The previous ``min(60, fps)``
+  // cap was correct when the record loop was rAF-driven (display refresh ≈
+  // 60–120 Hz), but the loop now runs on ``requestVideoFrameCallback`` —
+  // one render per decoded video frame, decoupled from display refresh.
+  // Capping at 60 silently downsamples 120/240 fps slo-mo footage to half
+  // its temporal resolution. Passing the source rate keeps every render
+  // eligible for capture. Passive mode (no fps argument) drops frames
+  // mid-record on iOS Safari, so we always pin a rate.
+  //
+  // The sampler still runs on its own clock — to keep the captured frames
+  // phase-locked with the rVFC renders (so sampler ticks between renders
+  // don't grab stale content) callers should also call
+  // ``videoTrack.requestFrame()`` immediately after each canvas render.
+  // ``requestFrame`` publishes the current canvas backbuffer as a fresh
+  // captured frame, overriding the sampler's own clock for that tick.
+  const canvasStream = canvas.captureStream(fps);
   const videoTrack = canvasStream.getVideoTracks()[0];
   return { videoStream: canvasStream, videoTrack };
 }

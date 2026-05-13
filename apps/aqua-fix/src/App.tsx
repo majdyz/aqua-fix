@@ -992,6 +992,14 @@ export default function App() {
 
     const fps = sourceFpsRef.current;
     const captureCtx = buildCaptureContext(canvas, fps);
+    // ``CanvasCaptureMediaStreamTrack.requestFrame`` published a fresh
+    // captured frame on demand. The cast is safe — captureStream always
+    // returns this subclass for canvas-sourced tracks; we feature-check
+    // before each call so older Safari builds without it fall back to
+    // the sampler-clock behaviour.
+    const captureVideoTrack = captureCtx.videoTrack as MediaStreamTrack & {
+      requestFrame?: () => void;
+    };
     if (!audioRoutingRef.current) audioRoutingRef.current = attachAudioRouting(video);
     const audioCapture = await captureAudioForRecording(audioRoutingRef.current);
     const stream = new MediaStream([
@@ -1039,6 +1047,13 @@ export default function App() {
       const v = videoRef.current;
       maybeRefreshStats(v);
       renderFrameSync(v);
+      // Phase-lock the captured frame to this render. captureStream's
+      // own sampler runs on an independent clock and can land between
+      // renders (stale-canvas dup) or beat the renderer (skipped
+      // render). ``requestFrame`` publishes the *current* backbuffer
+      // as the next captured frame so exactly one capture corresponds
+      // to one rVFC render — no dups, no drops.
+      captureVideoTrack.requestFrame?.();
       // Throttle React state updates to ~4 Hz; the rAF loop fires
       // ~60 Hz but the recording overlay only needs to tick on a
       // human-readable cadence. Avoids re-committing the component
