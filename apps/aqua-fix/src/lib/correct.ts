@@ -93,8 +93,17 @@ void main() {
   comp.b = c.b + u_alpha * blueComp * (1.0 - c.b) * c.g;
 
   // Shades-of-Gray white balance (gains derived from compensated Lp norms CPU-side).
-  // Clamp to [0,1] first so highlight regions don't get over-amplified by stretch.
-  vec3 wb = clamp(comp * u_wbGain, 0.0, 1.0);
+  // Soft-clip the high end instead of hard-clamping: pixels that already had
+  // legitimate red (coral, fish, skin) used to pin to 1.0 after multiplying
+  // by the SOG gain — they came out hue-flat and the rest of the colour
+  // discrimination went with them. Asymptotic roll-off above 0.9 keeps the
+  // hue intact even when raw R·gain exceeds 1.
+  vec3 raw_wb = comp * u_wbGain;
+  vec3 wb = mix(
+    raw_wb,
+    1.0 - 0.1 * exp((0.9 - raw_wb) / 0.1),
+    step(vec3(0.9), raw_wb)
+  );
 
   // Soft stretch: input is bounded [0,1], stats are post-clamp percentiles, and
   // the span is clamped to >=0.3 in computeStats so amplification stays sane.
@@ -413,8 +422,21 @@ export class Renderer {
   }
 }
 
-const SOG_P = 6;
-const MAX_GAIN = 4.5;
+// Lp norm for Shades-of-Gray WB. p=6 was Finlayson-Trezzi's original
+// recommendation but heavily emphasises bright outliers — a sunlit reef
+// patch or surface caustic dominates the norm and pushes the red gain
+// well past what the rest of the frame needs. p=2 is closer to the
+// classical Gray-World assumption and gives more balanced gains on the
+// underwater clips users actually run through this pipeline.
+const SOG_P = 2;
+
+// Cap on the per-channel WB multiplier. 4.5 was inherited from the
+// bornfree port; in practice that headroom is reachable only on very
+// deep / blue-tinted frames and reliably caused legitimate red objects
+// to clip to 1.0 (then the percentile stretch pinned them solid).
+// 3.0 still recovers the cast on >15 m footage without burning out
+// reds on shallower shots.
+const MAX_GAIN = 3.0;
 const MIN_GAIN = 0.4;
 
 export function computeStats(
@@ -491,8 +513,14 @@ export function computeStats(
     histB[(b * 255) | 0]++;
   }
 
-  const lowFrac = 0.005;
-  const highFrac = 0.995;
+  // Tighter clip on outliers (0.2% / 99.8% instead of 0.5% / 99.5%) so the
+  // stretch keeps more high-end headroom. The previous cuts ate most of
+  // the colour discrimination — the 99.5% point on a typical underwater
+  // histogram sat around the brightest legitimate red, and mapping that
+  // to 1.0 collapsed every coral/fish on the brighter side of the cut to
+  // the same saturated red.
+  const lowFrac = 0.002;
+  const highFrac = 0.998;
   const findCut = (hist: Uint32Array, frac: number) => {
     const targetN = frac * total;
     let acc = 0;
